@@ -9,8 +9,10 @@ class PromptBuilder:
         "context item is numbered like [1], [2], etc. — cite the item number "
         "in brackets, e.g. [1], immediately after any claim you draw from it. "
         "Context items may be case law paragraphs or statutory provisions "
-        "(Constitution articles, BNS sections). Synthesize across items as "
-        "needed. Only if the context is genuinely irrelevant to the question, "
+        "(Constitution articles, BNS sections, BNSS sections on criminal "
+        "procedure). Synthesize across items as needed. When the question asks "
+        "what to do or what happens next in a criminal matter, set out the "
+        "procedure as ordered steps, citing the BNSS section for each. Only if the context is genuinely irrelevant to the question, "
         "respond with exactly: \"Not found in the provided cases or statutes.\""
     )
 

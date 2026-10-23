@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory() as root:
     pdf.parent.mkdir(parents=True)
     pdf.write_bytes(b"%PDF-1.4 test")
     (Path(root) / "data" / "statutes" / "BNS.pdf").write_bytes(b"%PDF-1.4 bns")
+    (Path(root) / "data" / "statutes" / "BNSS.pdf").write_bytes(b"%PDF-1.4 bnss")
     (Path(root) / "notes.txt").write_text("not a pdf")
 
     print("--- Testing document file resolution ---")
@@ -31,6 +32,10 @@ with tempfile.TemporaryDirectory() as root:
     assert documents.statute_matches_file("BNS", "BNS.pdf")
     assert documents.statute_matches_file("Constitution", "constitution of india.pdf")
     assert not documents.statute_matches_file("Constitution", "BNS.pdf")
+    assert documents.statute_matches_file("BNSS", "BNSS.pdf")
+    assert not documents.statute_matches_file("BNS", "BNSS.pdf")  # "bns" is inside "bnss"
+    assert not documents.statute_matches_file("BNSS", "BNS.pdf")
     assert documents._statute_file_by_name("BNS").name == "BNS.pdf"
+    assert documents._statute_file_by_name("BNSS").name == "BNSS.pdf"
     assert documents._statute_file_by_name("Constitution") is None
     print("✓ document file resolution passed")

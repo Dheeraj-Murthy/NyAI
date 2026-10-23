@@ -54,10 +54,14 @@ def statute_matches_file(short_title: Optional[str], filename: str) -> bool:
     """Which statute a PDF holds, by file name — the rule ingest_statutes.py
     uses to pick the title it stores."""
     name = filename.lower()
+    is_bnss = any(k in name for k in ("bnss", "nagarik", "suraksha"))
     if (short_title or "").lower() == "constitution":
         return "constitution" in name
+    if (short_title or "").lower() == "bnss":
+        return is_bnss
     if (short_title or "").lower() == "bns":
-        return any(k in name for k in ("bns", "nyaya", "penal"))
+        # "bns" is also inside "bnss".
+        return not is_bnss and any(k in name for k in ("bns", "nyaya", "penal"))
     return False
 
 
