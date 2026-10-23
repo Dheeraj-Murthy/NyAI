@@ -224,10 +224,12 @@ def graph_judgment(judgment_id: int, depth: int = 2, max_nodes: int = 100) -> Di
     return _handle_response(resp)["data"]
 
 
-def graph_landmark_cases(limit: int = 10) -> List[Dict[str, Any]]:
+def graph_landmark_cases(limit: int = 10, rank_by: str = "pagerank") -> List[Dict[str, Any]]:
     try:
         resp = requests.get(
-            _url("/graph/landmark-cases"), params={"limit": limit}, timeout=DEFAULT_TIMEOUT
+            _url("/graph/landmark-cases"),
+            params={"limit": limit, "rank_by": rank_by},
+            timeout=DEFAULT_TIMEOUT,
         )
     except requests.RequestException as e:
         raise LegalRAGAPIError(str(e)) from e

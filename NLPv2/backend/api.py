@@ -2,7 +2,7 @@ from fastapi import Body, FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 import tempfile
 import os
 
@@ -341,12 +341,15 @@ async def get_citation_graph(
 
 
 @app.get("/graph/landmark-cases")
-async def get_landmark_cases(limit: int = 10):
+async def get_landmark_cases(
+    limit: int = 10,
+    rank_by: Literal["pagerank", "citations_per_year", "in_degree"] = "pagerank",
+):
     if not graph_manager:
         raise HTTPException(status_code=500, detail="Graph manager not initialized")
 
     try:
-        landmarks = graph_manager.get_landmark_cases(limit=limit)
+        landmarks = graph_manager.get_landmark_cases(limit=limit, rank_by=rank_by)
         return {"success": True, "data": landmarks}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

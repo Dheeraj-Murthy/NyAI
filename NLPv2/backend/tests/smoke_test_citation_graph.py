@@ -58,6 +58,18 @@ def test_citation_graph_manager():
         print(f"  - [{lm['judgment_id']}] {lm['label']} (PageRank: {lm['pagerank_score']}, In-Degree: {lm['in_degree']})")
     assert landmarks[0]["judgment_id"] == 1, "Case #1 should have highest PageRank/in-degree"
 
+    # Citations per year: #1 (1973) cited twice over 8 years to 1980 = 0.25;
+    # #2 (1978) cited once, floored at 5 years = 0.2.
+    by_rate = gm.get_landmark_cases(limit=3, rank_by="citations_per_year")
+    assert [lm["judgment_id"] for lm in by_rate[:2]] == [1, 2], by_rate
+    assert by_rate[0]["citations_per_year"] == 0.25 and by_rate[1]["citations_per_year"] == 0.2, by_rate
+    assert gm.get_landmark_cases(limit=1, rank_by="in_degree")[0]["judgment_id"] == 1
+    try:
+        gm.get_landmark_cases(rank_by="popularity")
+        raise AssertionError("an unknown rank_by should be rejected")
+    except ValueError:
+        pass
+
     # Test Shortest Path
     path = gm.get_shortest_path(3, 1)
     print(f"Shortest path from Case #3 -> Case #1: {path}")
