@@ -43,6 +43,34 @@ REL_RANK_SQL = (
 # API notices a migration or a stats run without a restart.
 CHECK_TTL_SECONDS = 300
 
+# Orders landmark_cases() can rank by.
+LANDMARK_RANKINGS = ("pagerank", "citations_per_year", "in_degree")
+
+# Citations per year = times cited / years since the judgment, counted up to
+# the newest judgment in the corpus rather than today, so the corpus cut-off
+# doesn't penalise recent cases. A case counts as at least this many years
+# old, so a couple of citations in its first year don't outrank decades of
+# steady citation.
+MIN_CITATION_YEARS = 5
+
+
+def citations_per_year(in_degree: int, judgment_year: Optional[int], end_year: Optional[int]) -> float:
+    """Times cited per year since the judgment; 0 when the judgment is undated."""
+    if not judgment_year or not end_year:
+        return 0.0
+    return in_degree / max(MIN_CITATION_YEARS, end_year - judgment_year + 1)
+
+
+def rank_landmarks(rows: List[Tuple[int, float, int, float]], rank_by: str, limit: int) -> List[Tuple[int, float, int, float]]:
+    """Top `limit` of (judgment_id, pagerank, in_degree, citations_per_year)
+    rows in the given order — the in-Python twin of landmark_cases()' SQL."""
+    keys = {
+        "pagerank": lambda r: (round(r[1], 6), r[2]),
+        "citations_per_year": lambda r: (r[3], r[2]),
+        "in_degree": lambda r: (r[2], r[1]),
+    }
+    return sorted(rows, key=keys[rank_by], reverse=True)[:limit]
+
 
 def make_label(petitioner: Optional[str], respondent: Optional[str]) -> str:
     return f"{petitioner or 'Unknown'} v. {respondent or 'Unknown'}"
@@ -193,19 +221,52 @@ class PostgresGraphStore:
                 return {r[0]: float(r[1]) for r in cur.fetchall()}
         return {n: pr for n, (pr, _) in self._fallback_stats().items() if pr > 0}
 
-    def landmark_cases(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def _judgment_years(self) -> Tuple[Dict[int, int], Optional[int]]:
+        """({judgment_id: year}, newest year in the corpus), for databases
+        where compute_graph_stats.py hasn't run yet."""
+        def compute():
+            with self._cursor() as cur:
+                cur.execute(
+                    "SELECT id, EXTRACT(YEAR FROM date_of_judgment)::int FROM judgments "
+                    "WHERE date_of_judgment IS NOT NULL"
+                )
+                years = dict(cur.fetchall())
+            return years, max(years.values(), default=None)
+        return self._cached("judgment_years", compute)
+
+    def landmark_cases(self, limit: int = 10, rank_by: str = "pagerank") -> List[Dict[str, Any]]:
+        """Top cases by PageRank, citations per year or total citations
+        (in-degree); each ties broken by the other measures."""
+        if rank_by not in LANDMARK_RANKINGS:
+            raise ValueError(f"rank_by must be one of {LANDMARK_RANKINGS}")
+        order = {
+            "pagerank": "s.pagerank DESC, s.in_degree DESC",
+            "citations_per_year": "citations_per_year DESC, s.in_degree DESC",
+            "in_degree": "s.in_degree DESC, s.pagerank DESC",
+        }[rank_by]
         with self._cursor() as cur:
             if self._stats_ready():
                 cur.execute(
-                    "SELECT s.judgment_id, s.pagerank, s.in_degree FROM judgment_graph_stats s "
-                    "ORDER BY s.pagerank DESC, s.in_degree DESC, s.judgment_id LIMIT %s",
-                    (limit,),
+                    "WITH span AS (SELECT EXTRACT(YEAR FROM MAX(date_of_judgment))::int AS end_year "
+                    "              FROM judgments) "
+                    "SELECT s.judgment_id, s.pagerank, s.in_degree, "
+                    # GREATEST skips NULLs, so an undated judgment needs its own branch.
+                    "       CASE WHEN j.date_of_judgment IS NULL THEN 0 "
+                    "            ELSE s.in_degree::float / GREATEST(%s, span.end_year "
+                    "                 - EXTRACT(YEAR FROM j.date_of_judgment)::int + 1) "
+                    "       END AS citations_per_year "
+                    "FROM judgment_graph_stats s JOIN judgments j ON j.id = s.judgment_id CROSS JOIN span "
+                    f"ORDER BY {order}, s.judgment_id LIMIT %s",
+                    (MIN_CITATION_YEARS, limit),
                 )
-                top = [(r[0], float(r[1]), int(r[2])) for r in cur.fetchall()]
+                top = [(r[0], float(r[1]), int(r[2]), float(r[3])) for r in cur.fetchall()]
             else:
-                stats = self._fallback_stats()
-                ranked = sorted(stats.items(), key=lambda kv: (round(kv[1][0], 6), kv[1][1]), reverse=True)
-                top = [(n, pr, deg) for n, (pr, deg) in ranked[:limit]]
+                years, end_year = self._judgment_years()
+                rows = [
+                    (n, pr, deg, citations_per_year(deg, years.get(n), end_year))
+                    for n, (pr, deg) in self._fallback_stats().items()
+                ]
+                top = rank_landmarks(rows, rank_by, limit)
             info = self._judgments(cur, [t[0] for t in top])
         return [
             {
@@ -214,9 +275,10 @@ class PostgresGraphStore:
                 "court": info.get(n, {}).get("court"),
                 "date": info.get(n, {}).get("date"),
                 "in_degree": deg,
+                "citations_per_year": round(cpy, 3),
                 "pagerank_score": round(pr, 6),
             }
-            for n, pr, deg in top
+            for n, pr, deg, cpy in top
         ]
 
     # -- traversal ------------------------------------------------------------

@@ -244,15 +244,30 @@ with tab_map:
             _network_table(int(map_id), n_cites, n_cited_by)
 
 with tab_landmarks:
-    st.caption("Top authority cases by PageRank centrality over the citation network.")
-    limit = st.number_input("Limit", min_value=1, max_value=100, value=10)
+    st.caption(
+        "Top authority cases over the citation network. Citations per year divides a case's citations by "
+        "the years since it was decided, so steadily cited recent cases aren't buried under old ones."
+    )
+    with st.container(horizontal=True):
+        rank_by = st.segmented_control(
+            "Rank by",
+            ["pagerank", "citations_per_year", "in_degree"],
+            format_func={
+                "pagerank": "PageRank",
+                "citations_per_year": "Citations per year",
+                "in_degree": "Total citations",
+            }.get,
+            default="pagerank",
+            key="landmark_rank_by",
+        ) or "pagerank"
+        limit = st.number_input("Limit", min_value=1, max_value=100, value=10)
 
     @st.cache_data(ttl=60)
-    def _landmark_cases(limit: int):
-        return api_client.graph_landmark_cases(limit=limit)
+    def _landmark_cases(limit: int, rank_by: str):
+        return api_client.graph_landmark_cases(limit=limit, rank_by=rank_by)
 
     try:
-        landmarks = _landmark_cases(limit)
+        landmarks = _landmark_cases(limit, rank_by)
     except Exception as e:
         render_api_error(e)
         landmarks = []
@@ -261,11 +276,13 @@ with tab_landmarks:
     if landmarks:
         landmark_event = st.dataframe(
             landmarks,
-            column_order=["judgment_id", "label", "court", "date", "in_degree", "pagerank_score"],
+            column_order=[
+                "judgment_id", "label", "court", "date", "in_degree", "citations_per_year", "pagerank_score",
+            ],
             width="stretch",
             on_select="rerun",
             selection_mode="multi-row",
-            key=f"landmark_table_{limit}",
+            key=f"landmark_table_{limit}_{rank_by}",
         )
         options = {f"{c['label']} (#{c['judgment_id']})": c["judgment_id"] for c in landmarks}
         focus_options = {k: (v, k.rsplit(" (#", 1)[0]) for k, v in options.items()}

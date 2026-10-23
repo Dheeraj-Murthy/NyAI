@@ -20,7 +20,8 @@ import networkx as nx
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from graph.pg_store import PostgresGraphStore
+from graph.citation_resolver import _year_of
+from graph.pg_store import LANDMARK_RANKINGS, PostgresGraphStore, citations_per_year, rank_landmarks
 
 try:
     from dotenv import load_dotenv
@@ -200,9 +201,10 @@ class CitationGraphManager:
             "truncated": truncated,
         }
 
-    def _mem_landmark_cases(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def _mem_landmark_cases(self, limit: int = 10, rank_by: str = "pagerank") -> List[Dict[str, Any]]:
         """
-        Identify top authority cases based on PageRank and in-degree centrality.
+        Identify top authority cases by PageRank, citations per year or
+        in-degree (see graph/pg_store.py for how citations per year is counted).
         """
         self._mem_load()
 
@@ -210,13 +212,21 @@ class CitationGraphManager:
             return []
 
         pagerank_scores = nx.pagerank(self.graph) if self.graph.number_of_edges() > 0 else {}
+        years = {n: _year_of(d.get("date")) for n, d in self.graph.nodes(data=True)}
+        end_year = max((y for y in years.values() if y), default=None)
 
+        rows = [
+            (
+                node,
+                pagerank_scores.get(node, 0.0),
+                self.graph.in_degree(node),
+                citations_per_year(self.graph.in_degree(node), years[node], end_year),
+            )
+            for node in self.graph.nodes()
+        ]
         landmarks = []
-        for node in self.graph.nodes():
-            score = pagerank_scores.get(node, 0.0)
-            in_degree = self.graph.in_degree(node)
+        for node, score, in_degree, cpy in rank_landmarks(rows, rank_by, limit):
             data = self.graph.nodes[node]
-
             landmarks.append(
                 {
                     "judgment_id": node,
@@ -224,12 +234,11 @@ class CitationGraphManager:
                     "court": data.get("court"),
                     "date": data.get("date"),
                     "in_degree": in_degree,
+                    "citations_per_year": round(cpy, 3),
                     "pagerank_score": round(score, 6),
                 }
             )
-
-        landmarks.sort(key=lambda x: (x["pagerank_score"], x["in_degree"]), reverse=True)
-        return landmarks[:limit]
+        return landmarks
 
     def _mem_shortest_path(self, source_id: int, target_id: int) -> Optional[List[int]]:
         """
@@ -412,11 +421,14 @@ class CitationGraphManager:
             return self._pg.subgraph(judgment_id, depth=depth, max_nodes=max_nodes)
         return self._mem_subgraph(judgment_id, depth=depth, max_nodes=max_nodes)
 
-    def get_landmark_cases(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Top authority cases by PageRank, then in-degree."""
+    def get_landmark_cases(self, limit: int = 10, rank_by: str = "pagerank") -> List[Dict[str, Any]]:
+        """Top authority cases by rank_by: "pagerank" (default),
+        "citations_per_year" or "in_degree"."""
+        if rank_by not in LANDMARK_RANKINGS:
+            raise ValueError(f"rank_by must be one of {LANDMARK_RANKINGS}")
         if self._use_postgres():
-            return self._pg.landmark_cases(limit=limit)
-        return self._mem_landmark_cases(limit=limit)
+            return self._pg.landmark_cases(limit=limit, rank_by=rank_by)
+        return self._mem_landmark_cases(limit=limit, rank_by=rank_by)
 
     def get_shortest_path(self, source_id: int, target_id: int) -> Optional[List[int]]:
         """Shortest citation chain from source to target, or None."""
