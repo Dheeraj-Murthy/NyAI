@@ -13,6 +13,21 @@ from sentence_transformers import SentenceTransformer
 _ARTICLE_REF_RE = re.compile(r"\b(?:article|art\.?)\s+(\d{1,3}[a-zA-Z]?)\b", re.IGNORECASE)
 _SECTION_REF_RE = re.compile(r"\b(?:section|sec\.?)\s+(\d{1,3}[a-zA-Z]?)\b", re.IGNORECASE)
 
+# Which statute a "section N" reference means, by the Act named in the query,
+# checked in order — BNSS before BNS, since one name contains the other. A
+# section of an Act that isn't ingested (CrPC, IPC, CPC, Evidence Act) maps to
+# None: the Sanhitas renumbered everything, so CrPC s.41 is not BNSS s.41.
+# No Act named means BNS, as before BNSS was added.
+_SECTION_STATUTES = [
+    ("BNSS", re.compile(r"\b(?:bnss|nagarik\s+suraksha)\b", re.IGNORECASE)),
+    ("BNS", re.compile(r"\b(?:bns|nyaya\s+sanhita)\b", re.IGNORECASE)),
+    (None, re.compile(
+        r"\b(?:cr\.?\s?p\.?\s?c|i\.?\s?p\.?\s?c|c\.?\s?p\.?\s?c|code\s+of\s+(?:criminal|civil)\s+procedure"
+        r"|penal\s+code|evidence\s+act)\b",
+        re.IGNORECASE,
+    )),
+]
+
 
 def _default_db_connection_string() -> str:
     """Build the default DSN from env vars, matching the docker-compose api
@@ -214,15 +229,18 @@ class LegalRetriever:
 
     def _extract_explicit_section_ref(self, query: str) -> Optional[Tuple[str, str]]:
         """Detects an explicit 'article N'/'art. N' (-> Constitution) or
-        'section N'/'sec. N' (-> BNS) reference in the query. Returns
+        'section N'/'sec. N' reference in the query. Returns
         (statute_short_title, section_number) or None. "article" only ever
-        refers to the Constitution and "section" is BNS's own terminology,
-        so the keyword alone disambiguates between the two ingested statutes."""
+        refers to the Constitution; a section belongs to the Act the query
+        names (see _SECTION_STATUTES), BNS when it names none."""
         m = _ARTICLE_REF_RE.search(query)
         if m:
             return ("Constitution", m.group(1))
         m = _SECTION_REF_RE.search(query)
         if m:
+            for short_title, named in _SECTION_STATUTES:
+                if named.search(query):
+                    return (short_title, m.group(1)) if short_title else None
             return ("BNS", m.group(1))
         return None
 

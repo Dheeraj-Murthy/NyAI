@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Ingest statutes (Constitution of India, BNS) into Legal RAG.
+"""Ingest statutes (Constitution of India, BNS, BNSS) into Legal RAG.
 
 Usage:
     python ingest_statutes.py --dir /path/to/pdfs
 
 PDFs are converted via `pdftotext`.  The Constitution is parsed with
-`-layout` mode (clean English article markers); BNS is parsed in raw
-mode (broader section-number detection).
+`-layout` mode (clean English article markers); BNS and BNSS are parsed
+in raw mode (broader section-number detection).
 
 Each article/section becomes one chunk + embedding stored in the
 `statute_sections` / `statute_embeddings` tables.
@@ -152,7 +152,7 @@ def parse_constitution(text: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# BNS parser – section splitting (raw text mode)
+# Sanhita parser (BNS, BNSS) – section splitting (raw text mode)
 # ---------------------------------------------------------------------------
 
 _SECTION_RE = re.compile(
@@ -160,10 +160,34 @@ _SECTION_RE = re.compile(
     re.M,
 )
 
+# Schedules follow the last section (BNSS has two, ~8,000 lines of tables
+# and forms) — without this they'd all be glued onto the final section.
+_SCHEDULE_RE = re.compile(r"^\s*THE (?:FIRST |SECOND |THIRD )?SCHEDULE\s*$", re.M)
+
+# Sections run 1, 2, 3, ... with no lettered insertions in the new Sanhitas.
+# A number already taken, or far from the last header, is a margin note that
+# happens to end in a section number — e.g. BNSS s.151's note "...under
+# sections 148, 149 and\n150." — and would otherwise split s.151 and, via
+# the (statute_id, section_number) upsert, overwrite the real s.150. Small
+# steps back are allowed: pdftotext sometimes emits a section just ahead of
+# its predecessor (BNSS s.170 comes out before s.169).
+_MAX_SECTION_JUMP = 5
+
 
 def parse_bns(text: str) -> List[Dict]:
     """Split gazette text into section chunks."""
-    headers = list(_SECTION_RE.finditer(text))
+    schedule = _SCHEDULE_RE.search(text)
+    if schedule:
+        text = text[:schedule.start()]
+    headers = []
+    seen = set()
+    last = 0
+    for m in _SECTION_RE.finditer(text):
+        num = int(m.group(1))
+        if num not in seen and abs(num - last) <= _MAX_SECTION_JUMP:
+            headers.append(m)
+            seen.add(num)
+            last = max(last, num)
     sections: List[Dict] = []
     for i, m in enumerate(headers):
         sec_num = m.group(1)
@@ -306,6 +330,10 @@ def main():
         name = p.name.lower()
         if "constitution" in name:
             configs.append((p, True,  "Constitution of India, 1950", "Constitution", 1950))
+        # Before BNS: "bns" is also inside "bnss". Same rule as
+        # backend/documents.py's statute_matches_file.
+        elif "bnss" in name or "nagarik" in name or "suraksha" in name:
+            configs.append((p, False, "Bharatiya Nagarik Suraksha Sanhita, 2023", "BNSS", 2023))
         elif "bns" in name or "nyaya" in name or "penal" in name:
             configs.append((p, False, "Bharatiya Nyaya Sanhita, 2023", "BNS", 2023))
         else:
