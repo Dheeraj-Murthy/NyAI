@@ -192,3 +192,9 @@ data/**
 # MLflow / ingestion pipeline outputs
 # =========================
 NLPv2/ingestion/outputs/
+
+# =========================
+# Scratch PDFs (interview prep, overviews, generated reports)
+# =========================
+*.pdf
+RAG_Technical_Guide.md
