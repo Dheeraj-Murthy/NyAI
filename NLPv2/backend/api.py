@@ -304,6 +304,45 @@ async def query_document(
             os.remove(tmp_path)
 
 
+@app.post("/document/summarize")
+async def summarize_document(
+    file: UploadFile = File(...),
+    include_debug: bool = Form(False),
+    model: Optional[str] = Form(None),
+    external_ok: bool = Form(False),
+    api_key: Optional[str] = Form(None),
+):
+    """Summarize an uploaded judgment and resolve its own cited cases to
+    judgment IDs in the corpus — distinct from /document, which answers a
+    question about the upload using semantic retrieval."""
+    if not pipeline:
+        raise HTTPException(status_code=500, detail="Pipeline not initialized")
+
+    if _requires_external_ok(model) and not external_ok:
+        raise HTTPException(status_code=400, detail="External model requires external_ok=true")
+
+    suffix = os.path.splitext(file.filename)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        result = pipeline.summarize_document(
+            document_path=tmp_path,
+            model=model,
+            external_ok=external_ok,
+            api_key=api_key,
+            include_debug_info=include_debug,
+        )
+        return {"success": True, "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 @app.post("/retrieval-test")
 async def test_retrieval(query: str = Form(...)):
     if not pipeline:

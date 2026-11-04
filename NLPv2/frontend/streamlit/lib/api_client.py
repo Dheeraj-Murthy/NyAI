@@ -200,6 +200,32 @@ def upload_document(
     return _handle_response(resp)["data"]
 
 
+def summarize_document(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+    include_debug: bool = False,
+    model: Optional[str] = None,
+    external_ok: bool = False,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    data = {"include_debug": include_debug, "external_ok": external_ok}
+    if model:
+        data["model"] = model
+    if api_key:
+        data["api_key"] = api_key
+    try:
+        resp = requests.post(
+            _url("/document/summarize"),
+            files={"file": (filename, file_bytes, content_type)},
+            data=data,
+            timeout=DOCUMENT_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise LegalRAGAPIError(str(e)) from e
+    return _handle_response(resp)["data"]
+
+
 def retrieval_test(query_text: str) -> Dict[str, Any]:
     try:
         resp = requests.post(

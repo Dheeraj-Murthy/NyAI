@@ -11,6 +11,7 @@ from post_processor import PostProcessor, RAGResponse
 from retrieval.reranker import CrossEncoderReranker
 from document_processor import DocumentProcessor
 from retrieval.citation_graph import CitationGraphManager
+from graph.citation_resolver import parse_reporter_citations, citation_titles
 from tracking import log_query_run
 from chat_store import ChatStore, DEFAULT_SESSION
 from chat_context import (
@@ -40,6 +41,18 @@ from chat_context import (
 
 # Extra room in the context block for documents cited earlier in a chat.
 CARRIED_DOCUMENT_TOKENS = 1200
+
+# How much of an uploaded judgment's OCR text to feed the LLM for a
+# whole-document summary — bigger than query_with_document's 3000-char
+# window, since a summary needs the full shape of the judgment, not just
+# enough to answer one question.
+SUMMARY_DOC_CHARS = 8000
+
+# Citations extracted straight from an uploaded document's text (as opposed
+# to retrieved from the corpus) are capped so a pathological OCR result
+# (e.g. a mis-OCR'd table) can't blow up the resolve-citations batch or the
+# per-citation precedent-summary lookups.
+MAX_EXTRACTED_CITATIONS = 40
 
 DEFAULT_QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-1M"
 
@@ -125,6 +138,21 @@ class LegalRAGPipeline:
         + " When analyzing an attached document, if it contains court judgments or "
         "legal cases, identify the parties involved, the key issues addressed, the "
         "court's reasoning and holding, and any cited precedents."
+    )
+
+    # Standalone (not an extension of SYSTEM_PROMPT): a summary has no
+    # retrieved context block to bind [n] citations to, so the mechanical
+    # citation-numbering instruction doesn't apply here — only the uploaded
+    # document's own text does.
+    SUMMARIZE_SYSTEM_PROMPT = (
+        "You are an Indian legal research assistant. Summarize the attached "
+        "court judgment for a lawyer who has not read it, using only what the "
+        "document itself says — never invent facts, parties, or outcomes not "
+        "present in the text. Cover, in order: (1) the parties and court, "
+        "(2) the key facts, (3) the legal issues framed, (4) the court's "
+        "reasoning, (5) the holding/ratio and final disposition. If the "
+        "attached text is not a court judgment, say so plainly and summarize "
+        "what it actually is instead."
     )
 
     def __init__(
@@ -615,13 +643,167 @@ class LegalRAGPipeline:
                 "confidence": 0.0,
             }
 
+    def _extract_citation_strings(self, text: str) -> List[str]:
+        """Every citation written in `text` (reporter citations and
+        "petitioner v respondent" case titles), as snippets suitable for
+        CitationGraphManager.resolve_citations — the same resolution path
+        edge-building uses, so an uploaded judgment's references resolve to
+        real judgment IDs in the corpus, not just semantically-similar
+        chunks."""
+        seen: set = set()
+        out: List[str] = []
+        for cit in parse_reporter_citations(text):
+            if cit.raw not in seen:
+                seen.add(cit.raw)
+                out.append(cit.raw)
+        for petitioner, respondent in citation_titles(text):
+            snippet = f"{petitioner} v {respondent}".strip()
+            key = snippet.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(snippet)
+        return out[:MAX_EXTRACTED_CITATIONS]
+
+    def summarize_document(
+        self,
+        document_path: str,
+        model: Optional[str] = None,
+        external_ok: bool = False,
+        api_key: Optional[str] = None,
+        include_debug_info: bool = False,
+    ) -> Dict[str, Any]:
+        """OCR an uploaded judgment, summarize it, and resolve every citation
+        written inside it to a judgment ID in the corpus (where possible) so
+        the caller can point to the actual cited documents — distinct from
+        query_with_document's semantic-retrieval-based citations, which only
+        surface corpus chunks similar to the document's own text/question."""
+        start_time = time.time()
+
+        try:
+            backend = self._resolve_backend(model, external_ok, api_key)
+        except (PrivacyGateError, RuntimeError, ValueError) as e:
+            return {"error": str(e), "summary": None, "cited_documents": []}
+
+        try:
+            doc_result = self.document_processor.process_document(document_path)
+
+            if not doc_result["success"]:
+                return {"error": doc_result["error"], "summary": None, "cited_documents": []}
+
+            ocr_text = doc_result["text"]
+            document_info = {
+                "source": doc_result["source"],
+                "pages": doc_result.get("pages", 1),
+                "type": doc_result.get("document_type", "unknown"),
+            }
+
+            extraction_start = time.time()
+            citation_strings = self._extract_citation_strings(ocr_text)
+            resolved = (
+                self.graph_manager.resolve_citations(citation_strings)
+                if citation_strings
+                else []
+            )
+            extraction_time = time.time() - extraction_start
+
+            cited_documents: List[Dict[str, Any]] = []
+            unresolved_citations: List[Dict[str, Any]] = []
+            precedent_chains: List[Dict[str, Any]] = []
+            for r in resolved:
+                judgment_id = r.get("judgment_id")
+                if judgment_id is None:
+                    unresolved_citations.append(
+                        {"citation_text": r["citation"], "status": r["method"]}
+                    )
+                    continue
+                summary = self.graph_manager.get_precedent_summary(judgment_id, top_n=2)
+                cited_documents.append(
+                    {
+                        "citation_text": r["citation"],
+                        "judgment_id": judgment_id,
+                        "label": summary["label"] if summary else f"Case #{judgment_id}",
+                        "resolution_method": r["method"],
+                        "confidence": r["score"],
+                    }
+                )
+                if summary:
+                    precedent_chains.append(summary)
+
+            # Shaped like a chat/query answer's refs (judgment_id + label per
+            # entry) so lib/case_graph.answer_cases()/render_answer_graph can
+            # be reused unchanged on the frontend.
+            citation_refs = [
+                {"judgment_id": c["judgment_id"], "label": c["label"]} for c in cited_documents
+            ]
+
+            context_block = self._build_document_context(
+                ocr_text, [], backend, max_doc_length=SUMMARY_DOC_CHARS
+            )
+
+            generation_start = time.time()
+            gen = backend.generate(
+                context_block=context_block,
+                user_query="Summarize this judgment.",
+                system_prompt=self.SUMMARIZE_SYSTEM_PROMPT,
+                max_new_tokens=self.max_new_tokens,
+            )
+            generation_time = time.time() - generation_start
+
+            total_time = time.time() - start_time
+
+            result = {
+                "summary": gen.text.strip(),
+                "document": document_info,
+                "cited_documents": cited_documents,
+                "unresolved_citations": unresolved_citations,
+                "precedent_chains": precedent_chains,
+                "citation_refs": citation_refs,
+                "citation_refs_by_type": {"judgment": citation_refs},
+                "source_refs": [],
+                "source_refs_by_type": {},
+                "metrics": self._build_metrics(
+                    gen,
+                    extraction_time,
+                    generation_time,
+                    total_time,
+                    len(citation_strings),
+                    extra={
+                        "document_pages": document_info["pages"],
+                        "citations_extracted": len(citation_strings),
+                        "citations_resolved": len(cited_documents),
+                    },
+                ),
+            }
+
+            if include_debug_info:
+                result["debug"] = {
+                    "ocr_text_preview": ocr_text[:800] + "..." if len(ocr_text) > 800 else ocr_text,
+                    "raw_response": gen.text,
+                    "citation_strings": citation_strings,
+                }
+
+            log_query_run(
+                endpoint="document_summarize",
+                params={"model_id": gen.model_id},
+                metrics=result["metrics"],
+            )
+
+            return result
+
+        except Exception as e:
+            return {
+                "error": f"Document summarization failed: {str(e)}",
+                "summary": None,
+                "cited_documents": [],
+            }
+
     def _build_document_context(
         self,
         ocr_text: str,
         retrieved_chunks: List[Dict[str, Any]],
         backend: LLMBackend,
+        max_doc_length: int = 3000,
     ) -> str:
-        max_doc_length = 3000
         if len(ocr_text) > max_doc_length:
             ocr_text = ocr_text[:max_doc_length] + "..."
 
