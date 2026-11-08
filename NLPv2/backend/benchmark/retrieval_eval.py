@@ -56,7 +56,7 @@ sys.path.insert(0, _backend_dir)
 
 import psycopg2  # noqa: E402
 
-from retrieval.retriever import LegalRetriever  # noqa: E402
+from retrieval.retriever import BM25_MODES, LegalRetriever  # noqa: E402
 from retrieval.reranker import CrossEncoderReranker  # noqa: E402
 import tracking  # noqa: E402
 
@@ -157,7 +157,7 @@ def run_two_stage_retrieval(
         similarity_threshold=threshold,
         graph_boost=graph_boost,
     )
-    stage2 = reranker.rerank(query, list(stage1), top_n=top_k)
+    stage2 = reranker.rerank_keep_pinned(query, list(stage1), top_n=top_k)
     return stage1, stage2
 
 
@@ -205,7 +205,8 @@ def run_eval(
     graph_boost: float = 0.0,
     k_values: Sequence[int] = DEFAULT_K_VALUES,
     crowd_threshold: int = DEFAULT_CROWD_THRESHOLD,
-    bm25_mode: str = "or",
+    bm25_mode: str = "and_or",
+    case_lookup: bool = True,
 ) -> Dict[str, Any]:
     records, gold_meta = load_gold_set(gold_path)
     k_values = sorted(set(k_values))
@@ -226,10 +227,10 @@ def run_eval(
     # expensive to construct; never re-instantiate per query.
     # Without a graph manager the retriever silently ignores graph_boost.
     graph_manager = None
-    if graph_boost > 0:
+    if graph_boost > 0 or case_lookup:
         from retrieval.citation_graph import CitationGraphManager
         graph_manager = CitationGraphManager()
-    retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode)
+    retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode, case_lookup=case_lookup)
     reranker = CrossEncoderReranker()
 
     per_query = []
@@ -332,6 +333,8 @@ def run_eval(
             "top_k": top_k,
             "graph_boost": graph_boost,
             "bm25_mode": bm25_mode,
+            "case_lookup": case_lookup,
+            "bm25_stats": dict(retriever.bm25_stats),
             "k_values": k_values,
             "crowd_threshold": crowd_threshold,
             "n_queries": len(valid_records),
@@ -411,8 +414,12 @@ def main() -> None:
         f"'high_crowd' in the discriminability-gate breakdown (default: {DEFAULT_CROWD_THRESHOLD})",
     )
     parser.add_argument(
-        "--bm25-mode", choices=("and", "or"), default="or",
-        help="BM25 leg: 'or' (default, production) or 'and' (old plainto_tsquery)",
+        "--bm25-mode", choices=BM25_MODES, default="and_or",
+        help="BM25 leg: and_or (default, production), and (plainto_tsquery only) or or",
+    )
+    parser.add_argument(
+        "--case-lookup", choices=("on", "off"), default="on",
+        help="Pin judgments the query names by citation / title (production: on)",
     )
     args = parser.parse_args()
 
@@ -420,6 +427,7 @@ def main() -> None:
     report = run_eval(
         args.gold, args.candidate_k, args.threshold, args.top_k, args.graph_boost, k_values,
         crowd_threshold=args.crowd_threshold, bm25_mode=args.bm25_mode,
+        case_lookup=args.case_lookup == "on",
     )
 
     output = args.output

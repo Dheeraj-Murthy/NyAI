@@ -66,6 +66,9 @@ KINDS = ("commentary", "masked_citation", "case_lookup", "aila")
 # trigram name match), not chat retrieval; it returns judgments, not chunks,
 # so it has no reranker stage (stage 2 = stage 1).
 RETRIEVERS = ("hybrid", "dense", "bm25", "lookup")
+# Mirrors retrieval.retriever.BM25_MODES (the retriever is imported lazily, so
+# the offline smoke tests run without psycopg2; tests assert the two match).
+BM25_MODES = ("and", "or", "and_or")
 DEFAULT_OVERFETCH = 2
 
 
@@ -156,7 +159,8 @@ def run_eval(
     overfetch: int = DEFAULT_OVERFETCH,
     limit: int = 0,
     retriever_mode: str = "hybrid",
-    bm25_mode: str = "or",
+    bm25_mode: str = "and_or",
+    case_lookup: bool = True,
 ) -> Dict[str, Any]:
     import psycopg2
 
@@ -191,10 +195,10 @@ def run_eval(
 
     # Without a graph manager the retriever silently ignores graph_boost.
     graph_manager = None
-    if graph_boost > 0 or retriever_mode == "lookup":
+    if graph_boost > 0 or retriever_mode == "lookup" or case_lookup:
         from retrieval.citation_graph import CitationGraphManager
         graph_manager = CitationGraphManager()
-    retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode)
+    retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode, case_lookup=case_lookup)
     reranker = CrossEncoderReranker()
 
     def first_stage(query: str, k: int) -> List[Dict[str, Any]]:
@@ -213,6 +217,7 @@ def run_eval(
     per_query = []
     bm25_empty = 0
     bm25_seconds = 0.0
+    n_pinned = n_pinned_relevant = 0
     start = time.time()
     for r in valid:
         query = r[query_field]
@@ -223,7 +228,7 @@ def run_eval(
         if retriever_mode == "lookup":
             stage2 = stage1[:top_k]
         else:
-            stage2 = reranker.rerank(query, list(stage1), top_n=top_k)
+            stage2 = reranker.rerank_keep_pinned(query, list(stage1), top_n=top_k)
         # Count only BM25 candidates that survive the exclusion: a passage
         # query is verbatim from the citing judgment, so with AND-semantics
         # its own chunk is often the only match.
@@ -238,6 +243,9 @@ def run_eval(
             "stage2": dedupe([c["judgment_id"] for c in stage2]),
         }
         relevant = r["relevant_judgment_ids"]
+        pinned = [c["judgment_id"] for c in stage1 if c.get("exact_match")]
+        n_pinned += bool(pinned)
+        n_pinned_relevant += any(j in relevant for j in pinned)
         group = group_of(r, kind)
         row = {
             "id": r["id"],
@@ -265,6 +273,7 @@ def run_eval(
             "query_field": query_field,
             "retriever": retriever_mode,
             "bm25_mode": bm25_mode,
+            "case_lookup": case_lookup,
             "candidate_k": candidate_k,
             "threshold": threshold,
             "top_k": top_k,
@@ -277,6 +286,10 @@ def run_eval(
             "n_partly_stale": sum(1 for r in valid if r["dropped_relevant"]),
             "n_bm25_empty": bm25_empty,
             "bm25_mean_ms": round(1000 * bm25_seconds / len(valid), 1) if valid else None,
+            # calls include the separate BM25-only call per query made for n_bm25_empty
+            "bm25_stats": dict(retriever.bm25_stats),
+            "n_lookup_pinned": n_pinned,
+            "n_lookup_pinned_relevant": n_pinned_relevant,
             "elapsed_s": round(elapsed, 2),
         },
         "gold_set": {**gold_meta, "current_judgment_count": judgment_count},
@@ -320,8 +333,10 @@ def main() -> None:
     parser.add_argument("--retriever", choices=RETRIEVERS, default="hybrid",
                         help="Stage-1 retriever: hybrid (default, as in production), dense only, BM25 only, "
                              "or lookup (Graph page case search; case_lookup sets only)")
-    parser.add_argument("--bm25-mode", choices=("and", "or"), default="or",
-                        help="BM25 leg: or (default, production) or and (old plainto_tsquery)")
+    parser.add_argument("--bm25-mode", choices=BM25_MODES, default="and_or",
+                        help="BM25 leg: and_or (default, production), and (plainto_tsquery only) or or")
+    parser.add_argument("--case-lookup", choices=("on", "off"), default="on",
+                        help="Pin judgments the query names by citation / title (production: on)")
     parser.add_argument("--overfetch", type=int, default=DEFAULT_OVERFETCH,
                         help="Stage-1 fetch multiplier when a record excludes judgments (default 2)")
     parser.add_argument("--k-values", default=",".join(str(k) for k in DEFAULT_K_VALUES))
@@ -332,7 +347,7 @@ def main() -> None:
     report = run_eval(
         args.gold, args.candidate_k, args.threshold, args.top_k, args.graph_boost,
         [int(k) for k in args.k_values.split(",")], args.query_field, args.overfetch, args.limit,
-        args.retriever, args.bm25_mode,
+        args.retriever, args.bm25_mode, args.case_lookup == "on",
     )
     cfg = report["config"]
     output = args.output or os.path.join(
@@ -352,7 +367,9 @@ def main() -> None:
     print(f"Config: {cfg}\n")
     print(f"BM25 had no usable candidate for {cfg['n_bm25_empty']}/{cfg['n_queries']} queries "
           "after excluding the citing judgment (hybrid ran dense-only for those); "
-          f"BM25 mean latency {cfg['bm25_mean_ms']} ms.\n")
+          f"BM25 mean latency {cfg['bm25_mean_ms']} ms; {cfg['bm25_stats']}.")
+    print(f"Case lookup pinned a judgment for {cfg['n_lookup_pinned']}/{cfg['n_queries']} queries, "
+          f"a relevant one for {cfg['n_lookup_pinned_relevant']}.\n")
     for stage, label in (("stage1", f"Stage 1 ({cfg['retriever']}, no reranker)"), ("stage2", "Stage 2 (reranked, final)")):
         print(f"{label}:")
         for k, v in report[f"aggregate_{stage}"].items():

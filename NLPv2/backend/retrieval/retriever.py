@@ -2,8 +2,16 @@ import os
 import re
 import psycopg2
 import json
+from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from sentence_transformers import SentenceTransformer
+
+from graph.citation_resolver import (
+    STOPWORDS as _NAME_STOPWORDS,
+    citation_titles,
+    normalize_case_name,
+    parse_reporter_citations,
+)
 
 
 # Explicit "article N" / "section N" references in a query let us skip
@@ -29,19 +37,44 @@ _SECTION_STATUTES = [
 ]
 
 
-# BM25 leg query modes. "and" is plainto_tsquery: every query word must occur
-# in one chunk, so a passage-length query matches nothing except (for the
-# masked-citation benchmark) the chunk it was copied from — hybrid then ran
-# dense-only for 89% of passage queries (benchmark/REPORT.md). "or" matches a
-# chunk containing any query term and ranks by cover density (ts_rank_cd).
-BM25_MODES = ("and", "or")
+# BM25 leg query modes (benchmark/REPORT.md, 2026-11-09 results):
+#   "and"     plainto_tsquery: every query word in one chunk. Precise — it is
+#             what makes "AIR 1978 SC 597" work — but a passage-length query
+#             matches nothing, so hybrid ran dense-only for 89% of them.
+#   "or"      any informative query term, ranked by ts_rank_cd. Helps long
+#             queries a little but drops citation hit@8 0.73 -> 0.02 (common
+#             terms "air", "sc", "1978" are pruned) and costs ~3.7 s per call.
+#   "and_or"  (default) the AND results first, then the remaining slots
+#             filled from a narrower OR query under a statement timeout.
+BM25_MODES = ("and", "or", "and_or")
 _TSQUERY_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 # OR over a term found in most chunks ("court", "appeal") makes nearly every
 # chunk a match and ts_rank_cd has to score them all. Terms whose chunk
-# frequency in pg_stats exceeds this are dropped; at most _OR_MAX_TERMS
-# terms are kept, rarest first.
-_OR_MAX_DF = 0.05
-_OR_MAX_TERMS = 32
+# frequency in pg_stats exceeds max_df are dropped; at most max_terms terms
+# are kept, rarest first. The fill query is narrower and time-capped, since
+# it runs on every query AND leaves short.
+_OR_MAX_DF, _OR_MAX_TERMS = 0.05, 32
+_FILL_MAX_DF, _FILL_MAX_TERMS = 0.01, 12
+_FILL_TIMEOUT_MS = 500
+_QUERY_CANCELED = "57014"  # Postgres SQLSTATE for statement_timeout
+
+# Case lookup: a judgment the query names by reporter citation or "X v. Y"
+# title is fetched through the citation resolver and pinned first (REPORT.md:
+# chat found a named case in its top 8 40% of the time; the alias table 98%).
+# Only the resolver's high-precision methods are trusted.
+_LOOKUP_METHODS = ("reporter", "exact_name")
+# "the Maneka Gandhi case": capitalised words right before "case".
+_NAMED_CASE_RE = re.compile(
+    r"((?:[A-Z][\w.'\u2019&-]*\s+(?:(?:of|and|the)\s+)?){1,6})[Cc]ase\b"
+)
+_GENERIC_CASE_WORDS = frozenset(
+    "this that present instant above said landmark famous which what the a an "
+    "criminal civil bail murder dowry writ appeal constitutional leading "
+    # sentence openers that get captured when a question starts with them
+    "is was are were did does do how why when where who explain describe summarise "
+    "summarize tell discuss compare in see per under cf".split()
+)
+_LOOKUP_MAX_JUDGMENTS = 4  # a party name matching more is too ambiguous to pin
 
 
 def _select_or_terms(
@@ -70,15 +103,42 @@ def _default_db_connection_string() -> str:
     return f"host={host} port={port} dbname={dbname} user={user} password={password}"
 
 
+def named_case_phrases(query: str) -> List[str]:
+    """Party names written as "<Name> case" ("the Maneka Gandhi case"), with
+    generic words ("this case", "the bail case") filtered out."""
+    out = []
+    for m in _NAMED_CASE_RE.finditer(query or ""):
+        tokens = normalize_case_name(m.group(1)).split()
+        while tokens and tokens[0] in _GENERIC_CASE_WORDS:
+            tokens.pop(0)
+        distinctive = [
+            t for t in tokens
+            if t not in _NAME_STOPWORDS and t not in _GENERIC_CASE_WORDS and len(t) > 2 and not t.isdigit()
+        ]
+        if distinctive:
+            out.append(" ".join(tokens))
+    return out
+
+
+def lookup_strings(query: str) -> List[str]:
+    """Citation snippets for the resolver: reporter citations and "X v. Y"
+    titles written in the query (same extraction as uploaded documents)."""
+    out = [c.raw for c in parse_reporter_citations(query or "")]
+    out += [f"{p} v {r}".strip() for p, r in citation_titles(query or "")]
+    return list(dict.fromkeys(out))
+
+
 class LegalRetriever:
-    bm25_mode = "or"
+    bm25_mode = "and_or"
+    case_lookup = True
     _chunk_doc_freq: Optional[Dict[str, float]] = None
 
     def __init__(
         self,
         db_connection_string: Optional[str] = None,
         graph_manager: Optional[Any] = None,
-        bm25_mode: str = "or",
+        bm25_mode: str = "and_or",
+        case_lookup: bool = True,
     ):
         if bm25_mode not in BM25_MODES:
             raise ValueError(f"bm25_mode must be one of {BM25_MODES}, got {bm25_mode!r}")
@@ -86,6 +146,10 @@ class LegalRetriever:
         self.embedding_model = None
         self.graph_manager = graph_manager
         self.bm25_mode = bm25_mode
+        # Needs graph_manager (the citation resolver); off without one.
+        self.case_lookup = case_lookup
+        # BM25 counters for evals: calls, fills (AND short, OR queried), fill timeouts.
+        self.bm25_stats: Counter = Counter()
         self._max_centrality: Optional[float] = None
         self._load_embedding_model()
 
@@ -430,7 +494,9 @@ class LegalRetriever:
             cur.close()
             conn.close()
 
-    def _or_query_terms(self, cur, query: str) -> List[str]:
+    def _or_query_terms(
+        self, cur, query: str, max_df: float = _OR_MAX_DF, max_terms: int = _OR_MAX_TERMS
+    ) -> List[str]:
         """Stemmed, stopword-free lexemes of the query (Postgres' own
         'english' config, so they match content_tsv), minus terms too common
         to be worth an OR — see _OR_MAX_DF."""
@@ -442,7 +508,7 @@ class LegalRetriever:
             (words,),
         )
         lexemes = [row[0] for row in cur.fetchall()]
-        return _select_or_terms(lexemes, self._doc_freq(cur), _OR_MAX_DF, _OR_MAX_TERMS)
+        return _select_or_terms(lexemes, self._doc_freq(cur), max_df, max_terms)
 
     def _doc_freq(self, cur) -> Dict[str, float]:
         """Share of judgment chunks containing each of the most common
@@ -465,54 +531,72 @@ class LegalRetriever:
             self._chunk_doc_freq = dict(zip(elems, freqs)) if elems and freqs else {}
         return self._chunk_doc_freq
 
+    _BM25_SQL = """
+        WITH q AS (SELECT {tsquery} AS tsq)
+        SELECT
+            jc.content,
+            j.petitioner,
+            j.respondent,
+            j.court,
+            EXTRACT(YEAR FROM j.date_of_judgment) as year,
+            jc.section,
+            jc.chunk_id,
+            jc.judgment_id,
+            {rank_fn}(jc.content_tsv, q.tsq) as bm25_score
+        FROM q, judgment_chunks jc
+        JOIN judgments j ON j.id = jc.judgment_id
+        WHERE jc.content_tsv @@ q.tsq AND NOT (jc.chunk_id = ANY(%s))
+        ORDER BY bm25_score DESC
+        LIMIT %s
+    """
+
+    def _bm25_query(self, cur, tsquery_arg: str, use_or: bool, k: int, skip_ids: List[int]):
+        if use_or:
+            # Lexemes are already stemmed and alphanumeric; 'simple' keeps
+            # them as they are instead of stemming a second time.
+            sql = self._BM25_SQL.format(tsquery="to_tsquery('simple', %s)", rank_fn="ts_rank_cd")
+        else:
+            sql = self._BM25_SQL.format(tsquery="plainto_tsquery('english', %s)", rank_fn="ts_rank")
+        cur.execute(sql, (tsquery_arg, list(skip_ids), k))
+        return cur.fetchall()
+
     def retrieve_bm25_candidates(
         self, query: str, candidate_k: int = 30
     ) -> List[Dict[str, Any]]:
         """Stage-1 retrieval (keyword leg): Postgres full-text search over
         judgment_chunks.content_tsv. Catches exact terms (statute numbers,
         party names, section numbers) that dense embeddings can blur past.
-        bm25_mode "or" (default) matches any non-trivial query term; "and"
-        is the old plainto_tsquery behaviour, kept for ablations."""
+        See BM25_MODES for and / or / and_or (default)."""
         conn = psycopg2.connect(self.db_connection_string)
         cur = conn.cursor()
+        self.bm25_stats["calls"] += 1
 
         try:
-            if self.bm25_mode == "and":
-                tsquery_sql, rank_fn, tsquery_arg = "plainto_tsquery('english', %s)", "ts_rank", query
-            else:
+            rows: List[Tuple] = []
+            if self.bm25_mode in ("and", "and_or"):
+                rows = self._bm25_query(cur, query, False, candidate_k, [])
+            if self.bm25_mode == "or":
                 terms = self._or_query_terms(cur, query)
-                if not terms:
-                    return []
-                # Lexemes are already stemmed and alphanumeric; 'simple' keeps
-                # them as they are instead of stemming a second time.
-                tsquery_sql, rank_fn = "to_tsquery('simple', %s)", "ts_rank_cd"
-                tsquery_arg = " | ".join(terms)
-            cur.execute(
-                f"""
-                WITH q AS (SELECT {tsquery_sql} AS tsq)
-                SELECT
-                    jc.content,
-                    j.petitioner,
-                    j.respondent,
-                    j.court,
-                    EXTRACT(YEAR FROM j.date_of_judgment) as year,
-                    jc.section,
-                    jc.chunk_id,
-                    jc.judgment_id,
-                    {rank_fn}(jc.content_tsv, q.tsq) as bm25_score
-                FROM q, judgment_chunks jc
-                JOIN judgments j ON j.id = jc.judgment_id
-                WHERE jc.content_tsv @@ q.tsq
-                ORDER BY bm25_score DESC
-                LIMIT %s
-            """,
-                (tsquery_arg, candidate_k),
-            )
-
-            results = cur.fetchall()
+                if terms:
+                    rows = self._bm25_query(cur, " | ".join(terms), True, candidate_k, [])
+            elif self.bm25_mode == "and_or" and len(rows) < candidate_k:
+                terms = self._or_query_terms(cur, query, _FILL_MAX_DF, _FILL_MAX_TERMS)
+                if terms:
+                    self.bm25_stats["fills"] += 1
+                    cur.execute(f"SET LOCAL statement_timeout = {int(_FILL_TIMEOUT_MS)}")
+                    try:
+                        rows += self._bm25_query(
+                            cur, " | ".join(terms), True, candidate_k - len(rows), [r[6] for r in rows]
+                        )
+                    except psycopg2.Error as e:
+                        if getattr(e, "pgcode", None) != _QUERY_CANCELED:
+                            raise
+                        # Too slow: keep the AND results rather than stall the chat.
+                        self.bm25_stats["fill_timeouts"] += 1
+                        conn.rollback()
 
             retrieved_chunks = []
-            for row in results:
+            for row in rows:
                 (
                     content,
                     petitioner,
@@ -552,6 +636,99 @@ class LegalRetriever:
             cur.close()
             conn.close()
 
+    # -- case lookup ----------------------------------------------------------
+
+    def lookup_named_judgments(self, query: str) -> List[Tuple[int, str]]:
+        """(judgment_id, how) for judgments the query names: reporter
+        citations and "X v. Y" titles through the citation resolver (only
+        reporter / exact_name resolutions), then "<Name> case" party names
+        matched against judgment_aliases when they name few enough judgments.
+        Empty when there's no graph manager or nothing is named."""
+        if not (self.case_lookup and self.graph_manager):
+            return []
+        found: Dict[int, str] = {}
+        strings = lookup_strings(query)
+        if strings:
+            for r in self.graph_manager.resolve_citations(strings):
+                if r.get("method") in _LOOKUP_METHODS and r.get("judgment_id") is not None:
+                    found.setdefault(r["judgment_id"], r["method"])
+        phrases = [] if found else named_case_phrases(query)
+        if phrases:
+            conn = psycopg2.connect(self.db_connection_string)
+            cur = conn.cursor()
+            try:
+                for name in phrases:
+                    esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    cur.execute(
+                        "SELECT DISTINCT judgment_id FROM judgment_aliases "
+                        "WHERE kind = 'case_name' AND (alias_norm LIKE %s OR alias_norm LIKE %s) "
+                        "LIMIT %s",
+                        (f"{esc} v %", f"% v {esc}", _LOOKUP_MAX_JUDGMENTS + 1),
+                    )
+                    ids = sorted(row[0] for row in cur.fetchall())
+                    if len(ids) <= _LOOKUP_MAX_JUDGMENTS:
+                        for jid in ids:
+                            found.setdefault(jid, "party_name")
+            finally:
+                cur.close()
+                conn.close()
+        return list(found.items())[:_LOOKUP_MAX_JUDGMENTS]
+
+    def _pinned_lookup_chunks(self, query: str) -> List[Dict[str, Any]]:
+        """For each judgment the query names, its chunk closest to the query,
+        marked exact_match so reranking keeps it first."""
+        named = self.lookup_named_judgments(query)
+        if not named:
+            return []
+        how = dict(named)
+        emb = self.get_query_embedding(query)
+        conn = psycopg2.connect(self.db_connection_string)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (jc.judgment_id)
+                    jc.content, j.petitioner, j.respondent, j.court,
+                    EXTRACT(YEAR FROM j.date_of_judgment), jc.section, jc.chunk_id, jc.judgment_id,
+                    1 - (je.embedding <=> %s::vector)
+                FROM judgment_chunks jc
+                JOIN judgment_embeddings je ON je.chunk_id = jc.chunk_id
+                JOIN judgments j ON j.id = jc.judgment_id
+                WHERE jc.judgment_id = ANY(%s)
+                ORDER BY jc.judgment_id, je.embedding <=> %s::vector
+                """,
+                (emb, list(how), emb),
+            )
+            rows = {r[7]: r for r in cur.fetchall()}
+        finally:
+            cur.close()
+            conn.close()
+        pinned = []
+        for jid, _ in named:  # resolver order: first named, first shown
+            if jid not in rows:
+                continue
+            content, pet, res, court, year, section, chunk_id, _, sim = rows[jid]
+            pinned.append({
+                "doc_type": "judgment",
+                "chunk_id": chunk_id,
+                "judgment_id": jid,
+                "text": (content or "").strip(),
+                "case": self._format_case_name(pet, res),
+                "court": court if court else "Unknown Court",
+                "year": int(year) if year else None,
+                "para": f"(chunk {chunk_id})",
+                "section": section,
+                "similarity": float(sim),
+                "bm25_score": 0.0,
+                # Above any real RRF score (<= ~0.04) but finite: chunks reach
+                # API responses (debug), and JSON has no Infinity.
+                "rrf_score": 1.0,
+                "graph_centrality": 0.0,
+                "exact_match": True,
+                "lookup_method": how[jid],
+            })
+        return pinned
+
     def retrieve_judgment_candidates(
         self,
         query: str,
@@ -563,6 +740,9 @@ class LegalRetriever:
         """Stage-1 retrieval for judgments only: fuse dense (pgvector cosine)
         and BM25 (full-text) judgment candidates via Reciprocal Rank Fusion.
         Optional graph_boost > 0 reweights RRF scores using PageRank centrality.
+        Judgments the query names (citation, "X v. Y", "<Name> case") are
+        looked up directly and pinned first, marked exact_match — see
+        lookup_named_judgments.
         Statutes are retrieved independently via retrieve_statute_candidates —
         pooling them into one ranked list structurally disadvantaged statutes
         (they only ever earned one RRF "vote" vs. judgments' two), so the two
@@ -616,6 +796,10 @@ class LegalRetriever:
             fused[key]["graph_centrality"] = c_score
 
         ranked = sorted(fused.values(), key=lambda c: c["rrf_score"], reverse=True)
+        pinned = self._pinned_lookup_chunks(query)
+        if pinned:
+            pinned_ids = {c["chunk_id"] for c in pinned}
+            ranked = pinned + [c for c in ranked if c["chunk_id"] not in pinned_ids]
         return ranked[:candidate_k]
 
     def _format_case_name(

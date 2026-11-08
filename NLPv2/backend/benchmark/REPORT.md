@@ -625,3 +625,41 @@ candidate for 41/43 queries. Too few queries for more than a sanity check.
   the MiniLM reranker hurts.
 - Short, name/citation queries: AND-BM25 is essential, the reranker helps
   a little, and a direct alias lookup beats everything.
+
+## Update (2026-11-09): case lookup in chat + BM25 `and_or` (issue #12) — not yet measured
+
+Two changes, following the results above:
+
+1. **Case lookup in chat retrieval.** `retrieve_judgment_candidates` now
+   checks the query for reporter citations and "X v. Y" titles and resolves
+   them with the citation-graph resolver (`resolve_citations`; only
+   `reporter` / `exact_name` resolutions are trusted). A "<Name> case"
+   mention is matched against `judgment_aliases` party names and used only
+   when it names ≤4 judgments. Each named judgment's chunk closest to the
+   query is put first, marked `exact_match`, and
+   `CrossEncoderReranker.rerank_keep_pinned` keeps it first through
+   reranking — the mechanism statutes already used for "section N" (chat's
+   `_rerank_statutes` now calls the same method). Needs a graph manager;
+   chat always has one. Evals: `--case-lookup on|off`.
+2. **BM25 `and_or` (new default).** AND (`plainto_tsquery`) first; if it
+   returns fewer than `candidate_k` chunks, the remaining slots are filled
+   from an OR query over the ≤12 rarest query terms found in ≤1% of chunks,
+   under a 500 ms `statement_timeout` (on timeout the AND results are kept).
+   `and` and `or` remain for ablations. Evals report
+   `bm25_stats` (calls, fills, fill_timeouts) and how many queries had a
+   pinned / relevant pinned judgment.
+
+Checked offline (`tests/smoke_test_bm25_or.py`) and against a scratch
+pgvector Postgres with the real schema: citation, title and party-name
+lookup resolve; pinned chunk first; AND rows then OR fill with no duplicate;
+forced timeout falls back to the AND rows.
+
+```bash
+cd NLPv2/backend
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --case-lookup off
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --query-field query_short
+python benchmark/retrieval_eval.py --gold benchmark/data/gold_set.json
+python benchmark/judgment_eval.py --gold benchmark/data/aila_gold_v1.json
+```
