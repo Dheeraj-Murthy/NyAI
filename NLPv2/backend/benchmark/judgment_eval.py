@@ -10,6 +10,8 @@ Scores two kinds of gold set:
   case_lookup      case_lookup_gold.py: a case name, a party name or a
                    reporter citation; relevant = the judgment(s) it names.
                    Broken down by query variant.
+  aila             aila_benchmark.py export: a FIRE 2019 AILA fact situation;
+                   relevant = its precedents that map onto the corpus.
 
 Per stage, over DISTINCT judgments (retrieval returns chunks, and one case
 can fill several of the top 8, so stage 2 can hold fewer than 8 cases):
@@ -59,7 +61,7 @@ from graph.citation_resolver import case_name_alias  # noqa: E402
 from metrics import aggregate_multi, bootstrap_ci, dedupe, mrr, recall_at_k  # noqa: E402
 
 DEFAULT_K_VALUES = (1, 3, 5, 8, 10, 30)
-KINDS = ("commentary", "masked_citation", "case_lookup")
+KINDS = ("commentary", "masked_citation", "case_lookup", "aila")
 # lookup = the Graph page's case search (judgment_aliases: reporter keys and
 # trigram name match), not chat retrieval; it returns judgments, not chunks,
 # so it has no reranker stage (stage 2 = stage 1).
@@ -94,6 +96,8 @@ def group_of(record: Dict[str, Any], kind: str) -> str:
         return in_degree_bucket(record.get("target_in_degree", 0))
     if kind == "case_lookup":
         return record.get("variant", "?")
+    if kind == "aila":
+        return record.get("split", "?")
     return record.get("source_id", "?")
 
 

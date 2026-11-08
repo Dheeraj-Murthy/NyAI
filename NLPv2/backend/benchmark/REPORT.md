@@ -493,3 +493,64 @@ reporter numbers), so this is also the set where the OR-query change can
 help or hurt most; dense is likely weak on bare citations. If `lookup`
 beats chat retrieval by a wide margin, routing name/citation queries in
 chat through the alias table is the obvious fix.
+
+## Update (2026-11-08): FIRE 2019 AILA benchmark (issue #15)
+
+External labels and published runs to compare against: 50 fact situations
+(Q1–10 training, **Q11–50 the official test**), a pool of 2,914 Supreme Court
+judgments and 197 statutes, TREC qrels. CC BY 4.0, Zenodo
+10.5281/zenodo.4063986, pinned by sha256 in `aila_benchmark.py`.
+
+**`pool`** ranks AILA's own pool with our stack — BM25, BGE-base dense
+(500-word chunks, best chunk per document, as ingestion's size-based
+chunker), RRF fusion (k=60, as production), optional MiniLM rerank of the
+top 30 — and scores the track's measures over the full ranking. It also
+writes a TREC run file. No database needed. Metric code checked against
+trec_eval (`pytrec_eval`): identical to 4 decimals on all four measures.
+
+**`export`** maps AILA's relevant judgments onto our corpus (title + year
+through the citation resolver, exact-name matches only) and writes a
+`judgment_eval.py` gold set (`kind: aila`, grouped by train/test) that
+scores production retrieval over the whole corpus. Precedents only — AILA's
+statutes are IPC/CrPC/Constitution sections, the corpus has the Sanhitas.
+Needs the DB; not yet run, so the mapping rate is unknown.
+
+### Results on the AILA pool (test queries Q11–50, n=40)
+
+| Task | Run | MAP | P@10 | BPREF | RR |
+|---|---|---|---|---|---|
+| Precedents | BM25 (ours) | 0.1333 | 0.0575 | 0.1160 | 0.2557 |
+| Precedents | best 2019 run (HLJIT task1 2) | 0.1492 | 0.0700 | 0.1286 | 0.288 |
+| Precedents | 2019 BM25 run (HLJIT task1 1) | 0.1335 | 0.0600 | 0.1134 | 0.282 |
+| Statutes | BM25 (ours) | 0.0756 | 0.0475 | 0.0423 | 0.1937 |
+| Statutes | BGE dense | 0.0753 | 0.0425 | 0.0383 | 0.1735 |
+| Statutes | hybrid (RRF) | 0.0790 | 0.0325 | 0.0435 | 0.1918 |
+| Statutes | hybrid + MiniLM rerank | 0.0820 | 0.0400 | 0.0471 | 0.1654 |
+| Statutes | best 2019 run (thuir legal 2) | 0.1566 | 0.0975 | 0.0961 | 0.281 |
+
+- Our BM25 lands on the published BM25 run (0.1333 vs 0.1335), which is a
+  good check that the adapter and metrics are right.
+- Statutes: hybrid and rerank move MAP by under 0.01 on 40 queries — noise.
+  We sit at half the best 2019 run, which summarised the query first;
+  AILA queries are 300–600-word situations and BGE truncates at 512 tokens.
+- **Precedent dense / hybrid / rerank not yet run**: embedding the pool is
+  ~21k chunks, too slow on a laptop CPU (stopped after 30+ min). Run on the
+  server GPU; embeddings are cached in `benchmark/work/aila/`.
+
+### IL-TUR
+
+`Exploration-Lab/IL-TUR` on Hugging Face is gated (accept the terms on the
+dataset page, then use an HF token) and CC BY-NC-SA. Of its tasks, PCR
+(prior case retrieval: 237 test query judgments, 1.7k candidates, µF1@K)
+fits the same `pool` design; LSI is IPC-section classification, which our
+system doesn't do. Not integrated yet, pending access.
+
+```bash
+cd NLPv2/backend
+python benchmark/aila_benchmark.py download
+for r in bm25 dense hybrid; do python benchmark/aila_benchmark.py pool --task cases --retriever $r; done
+python benchmark/aila_benchmark.py pool --task cases --retriever hybrid --rerank
+python benchmark/aila_benchmark.py export --version v1
+python benchmark/judgment_eval.py --gold benchmark/data/aila_gold_v1.json
+python tests/smoke_test_aila.py
+```
