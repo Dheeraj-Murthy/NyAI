@@ -663,3 +663,32 @@ python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.
 python benchmark/retrieval_eval.py --gold benchmark/data/gold_set.json
 python benchmark/judgment_eval.py --gold benchmark/data/aila_gold_v1.json
 ```
+
+### Results (2026-11-09, server) and follow-up
+
+Final hit@8 (stage 2):
+
+| Set | AND (before) | `and_or`, lookup off | `and_or` + lookup |
+|---|---|---|---|
+| case lookup, all (n=648) | 0.397 | 0.491 | **0.656** [0.619, 0.691] |
+| — citation / full_name / party / question | 0.73 / 0.38 / 0.31 / 0.40 | 0.73 / 0.47 / 0.45 / 0.48 | **0.97 / 0.63 / 0.61 / 0.63** |
+| masked citation, passage | 0.200 | — | 0.206 |
+| masked citation, `query_short` | 0.070 | — | 0.086 |
+| synthetic, judgment recall@8 | 0.625 | — | 0.662 |
+| AILA mapped (n=43) | 0.093 | — | 0.093 |
+
+- Lookup pinned a judgment for 298/648 case-lookup queries (276 relevant)
+  and for 4/500 masked-citation queries (none relevant — stray titles).
+- The fill helped short queries (case lookup without pinning 0.397 →
+  0.491), but on passages it timed out 856/990 times and on AILA 86/86,
+  raising BM25 latency 45 → 519 ms for no gain.
+
+Follow-up (not yet measured):
+- Titles were pinned for only ~half of the full-name / question queries:
+  the title regex stops at commas and "M/S.", and the resolver refuses a
+  name shared by connected appeals. Lookup now also matches every full case
+  name contained in the normalised query (longest names only, ≤4
+  judgments), as the Graph search does; "<Name> case" accepts "M/S." and
+  "for/in/on/to/&".
+- The fill is skipped for queries with >30 distinct lexemes and uses ≤8
+  terms (was 12).

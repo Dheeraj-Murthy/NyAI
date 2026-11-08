@@ -49,8 +49,9 @@ class Timeout(sys.modules["psycopg2"].Error):
 
 
 class FakeCursor:
-    def __init__(self, lexemes, stats, and_rows, or_rows, or_error=None, alias_ids=()):
+    def __init__(self, lexemes, stats, and_rows, or_rows, or_error=None, alias_ids=(), contained=()):
         self.lexemes, self.stats = lexemes, stats
+        self.contained = list(contained)  # (alias_norm, judgment_id) rows for the title fallback
         self.and_rows, self.or_rows, self.or_error = and_rows, or_rows, or_error
         self.alias_ids = list(alias_ids)
         self.executed, self._rows = [], []
@@ -69,7 +70,10 @@ class FakeCursor:
             if self.or_error:
                 raise self.or_error
             self._rows = list(self.or_rows)
-        elif "judgment_aliases" in sql:
+        elif "SELECT alias_norm, judgment_id FROM judgment_aliases" in sql:
+            q = params[0]
+            self._rows = [(a, j) for a, j in self.contained if f" {a} " in q]
+        elif "DISTINCT judgment_id FROM judgment_aliases" in sql:
             self._rows = [(j,) for j in self.alias_ids]
         elif "DISTINCT ON (jc.judgment_id)" in sql:
             self._rows = [("pinned text", "P", "R", "SC", 1978, "ratio", 900 + j, j, 0.7) for j in params[1]]
@@ -189,6 +193,18 @@ def test_and_or_fill():
     r, _ = make_retriever("and_or", cur)
     assert len(r.retrieve_bm25_candidates("bail", candidate_k=2)) == 2 and len(bm25_sql(cur)) == 1
     assert r.bm25_stats["fills"] == 0
+
+    # Passage-length query: no fill (it timed out almost every time on the server).
+    many = [f"w{i}" for i in range(31)]
+    cur = FakeCursor(many, STATS, [], [row(8, 4)])
+    r, _ = make_retriever("and_or", cur)
+    assert r.retrieve_bm25_candidates(" ".join(many), candidate_k=5) == []
+    assert len(bm25_sql(cur)) == 1 and r.bm25_stats == {"calls": 1, "fill_skipped_long": 1}
+    # The fill keeps at most 8 terms.
+    cur = FakeCursor(many[:20], STATS, [], [])
+    r, _ = make_retriever("and_or", cur)
+    r.retrieve_bm25_candidates("x", candidate_k=5)
+    assert bm25_sql(cur)[-1][1][0] == " | ".join(many[:8])
     print("✓ and_or fill passed")
 
 
@@ -219,6 +235,7 @@ def test_lookup_extraction():
     assert lookup_strings("Is bail a right?") == []
     assert named_case_phrases("Explain the Maneka Gandhi case") == ["maneka gandhi"]
     assert named_case_phrases("Is the State of Punjab case relevant?") == ["state of punjab"]
+    assert named_case_phrases("the M/S. Tata Iron and Steel Co. Ltd. case") == ["tata iron and steel co ltd"]  # aliases keep "co ltd" too
     for generic in ("Explain this case", "In the bail case of the accused", "The Constitutional case law"):
         assert named_case_phrases(generic) == [], generic
     print("✓ extraction passed")
@@ -255,6 +272,25 @@ def test_lookup_and_pinning():
     cur = FakeCursor([], None, [], [], alias_ids=range(30, 35))
     r, _ = make_retriever("and", cur, FakeGraph({}))
     assert r.lookup_named_judgments("the State of Punjab case") == []
+
+    # Title the regex can't read (comma in a party name), resolver unresolved:
+    # every full case name inside the normalised query, longest names only.
+    contained = [("commissioner of income tax west bengal v ram kumar", 41),
+                 ("commissioner of income tax west bengal v ram kumar", 42),  # connected appeal
+                 ("ram kumar v state", 43)]
+    cur = FakeCursor([], None, [], [], contained=contained + [("tax west bengal v ram kumar", 44)])
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    q = "What did the Court hold in The Commissioner of Income Tax, West Bengal v. Ram Kumar?"
+    assert r.lookup_named_judgments(q) == [(41, "title_alias"), (42, "title_alias")]
+    # A name shared by more judgments than the cap is not pinned.
+    cur = FakeCursor([], None, [], [], contained=[("x y v z w", j) for j in range(50, 56)])
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    assert r.lookup_named_judgments("X Y v. Z W") == []
+    # No " v " in the query: no alias scan at all.
+    cur = FakeCursor([], None, [], [])
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    r.lookup_named_judgments("Is bail a right?")
+    assert not any("judgment_aliases" in s for s, _ in cur.executed)
 
     # Off without a graph manager or when disabled.
     r, _ = make_retriever("and", FakeCursor([], None, [], []), None)

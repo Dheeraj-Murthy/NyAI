@@ -54,7 +54,11 @@ _TSQUERY_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 # are kept, rarest first. The fill query is narrower and time-capped, since
 # it runs on every query AND leaves short.
 _OR_MAX_DF, _OR_MAX_TERMS = 0.05, 32
-_FILL_MAX_DF, _FILL_MAX_TERMS = 0.01, 12
+_FILL_MAX_DF, _FILL_MAX_TERMS = 0.01, 8
+# A query with more distinct lexemes than this is passage-length; on the
+# 2026-11-09 server run its fill timed out 856/990 times (AILA: 86/86), adding
+# ~0.5 s for nothing, so the fill is skipped for it.
+_FILL_MAX_QUERY_LEXEMES = 30
 _FILL_TIMEOUT_MS = 500
 _QUERY_CANCELED = "57014"  # Postgres SQLSTATE for statement_timeout
 
@@ -65,7 +69,7 @@ _QUERY_CANCELED = "57014"  # Postgres SQLSTATE for statement_timeout
 _LOOKUP_METHODS = ("reporter", "exact_name")
 # "the Maneka Gandhi case": capitalised words right before "case".
 _NAMED_CASE_RE = re.compile(
-    r"((?:[A-Z][\w.'\u2019&-]*\s+(?:(?:of|and|the)\s+)?){1,6})[Cc]ase\b"
+    r"((?:[A-Z][\w.'\u2019&/-]*\s+(?:(?:of|and|the|for|in|on|to|&)\s+)?){1,6})[Cc]ase\b"
 )
 _GENERIC_CASE_WORDS = frozenset(
     "this that present instant above said landmark famous which what the a an "
@@ -500,6 +504,12 @@ class LegalRetriever:
         """Stemmed, stopword-free lexemes of the query (Postgres' own
         'english' config, so they match content_tsv), minus terms too common
         to be worth an OR — see _OR_MAX_DF."""
+        lexemes = self._query_lexemes(cur, query)
+        return _select_or_terms(lexemes, self._doc_freq(cur), max_df, max_terms) if lexemes else []
+
+    @staticmethod
+    def _query_lexemes(cur, query: str) -> List[str]:
+        """Distinct stemmed, stopword-free lexemes in query order."""
         words = " ".join(_TSQUERY_WORD_RE.findall(query))
         if not words:
             return []
@@ -507,8 +517,7 @@ class LegalRetriever:
             "SELECT lexeme FROM unnest(to_tsvector('english', %s)) ORDER BY positions[1]",
             (words,),
         )
-        lexemes = [row[0] for row in cur.fetchall()]
-        return _select_or_terms(lexemes, self._doc_freq(cur), max_df, max_terms)
+        return [row[0] for row in cur.fetchall()]
 
     def _doc_freq(self, cur) -> Dict[str, float]:
         """Share of judgment chunks containing each of the most common
@@ -580,7 +589,12 @@ class LegalRetriever:
                 if terms:
                     rows = self._bm25_query(cur, " | ".join(terms), True, candidate_k, [])
             elif self.bm25_mode == "and_or" and len(rows) < candidate_k:
-                terms = self._or_query_terms(cur, query, _FILL_MAX_DF, _FILL_MAX_TERMS)
+                lexemes = self._query_lexemes(cur, query)
+                terms = []
+                if len(lexemes) > _FILL_MAX_QUERY_LEXEMES:
+                    self.bm25_stats["fill_skipped_long"] += 1
+                elif lexemes:
+                    terms = _select_or_terms(lexemes, self._doc_freq(cur), _FILL_MAX_DF, _FILL_MAX_TERMS)
                 if terms:
                     self.bm25_stats["fills"] += 1
                     cur.execute(f"SET LOCAL statement_timeout = {int(_FILL_TIMEOUT_MS)}")
@@ -652,12 +666,21 @@ class LegalRetriever:
             for r in self.graph_manager.resolve_citations(strings):
                 if r.get("method") in _LOOKUP_METHODS and r.get("judgment_id") is not None:
                     found.setdefault(r["judgment_id"], r["method"])
+        norm = normalize_case_name(query)
+        title_fallback = not found and " v " in f" {norm} "
         phrases = [] if found else named_case_phrases(query)
-        if phrases:
+        if title_fallback or phrases:
             conn = psycopg2.connect(self.db_connection_string)
             cur = conn.cursor()
             try:
-                for name in phrases:
+                if title_fallback:
+                    # The title regex misses party names with commas or "M/S."
+                    # and the resolver refuses names shared by connected
+                    # appeals, so also match every full case name contained in
+                    # the normalised query (as the Graph page search does).
+                    for jid in self._contained_case_names(cur, norm):
+                        found.setdefault(jid, "title_alias")
+                for name in ([] if found else phrases):
                     esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                     cur.execute(
                         "SELECT DISTINCT judgment_id FROM judgment_aliases "
@@ -673,6 +696,23 @@ class LegalRetriever:
                 cur.close()
                 conn.close()
         return list(found.items())[:_LOOKUP_MAX_JUDGMENTS]
+
+    @staticmethod
+    def _contained_case_names(cur, norm_query: str) -> List[int]:
+        """Judgments whose full normalised case name occurs in the normalised
+        query, keeping only the longest names matched (so "ram v state" inside
+        "sita ram v state of punjab" doesn't count). None when that names more
+        than _LOOKUP_MAX_JUDGMENTS judgments."""
+        cur.execute(
+            "SELECT alias_norm, judgment_id FROM judgment_aliases "
+            "WHERE kind = 'case_name' AND %s LIKE '%%' || ' ' || alias_norm || ' ' || '%%'",
+            (f" {norm_query} ",),
+        )
+        hits = cur.fetchall()
+        aliases = {a for a, _ in hits}
+        maximal = {a for a in aliases if not any(a != b and f" {a} " in f" {b} " for b in aliases)}
+        ids = sorted({j for a, j in hits if a in maximal})
+        return ids if len(ids) <= _LOOKUP_MAX_JUDGMENTS else []
 
     def _pinned_lookup_chunks(self, query: str) -> List[Dict[str, Any]]:
         """For each judgment the query names, its chunk closest to the query,
