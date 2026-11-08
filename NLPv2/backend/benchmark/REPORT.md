@@ -242,3 +242,60 @@ there was effectively no gap left to close.
   benchmarking technique — bigger than either fix made in this update.
 - Corpus corruption re-scan (corrected non-ASCII threshold) is still
   outstanding, unrelated to the above.
+
+---
+
+## Update (2026-11-08): commentary gold set — government sources (in progress, issue #11)
+
+The synthetic gold set writes each question *from the chunk it is scored
+against*, and the 25% word-overlap gate actively requires the question to
+reuse that chunk's wording. It therefore measures paraphrase lookup more
+than legal research, and favours BM25. A second, independent gold set is
+being built from government legal commentary: a commentary states a
+proposition of law and cites the Supreme Court cases behind it, written by
+people who never saw our chunks.
+
+### Scope (deliberately small)
+
+| Source | Status |
+|---|---|
+| Law Commission Report No. 262, *The Death Penalty* (2015) | in manifest, text layer |
+| Law Commission Report No. 268, *Provisions Relating to Bail* (2017) | in manifest, text layer |
+| Law Commission Report No. 277, *Wrongful Prosecution* (2018) | in manifest, scanned → OCR |
+| National / State Judicial Academy compendiums | next, once official PDFs are located |
+| Official SCR / eSCR headnotes | **excluded**: the JUDIS corpus already contains each judgment's `HEADNOTE:` section, so a headnote-derived question would be scored against its own source |
+
+Target: ~100–150 human-reviewed queries before quoting any number.
+
+### Pipeline (`commentary_gold.py`, `commentary_eval.py`)
+
+1. `extract` — pdftotext per page, OCR (pdftoppm + tesseract) for pages
+   with no text layer, cached; keep pages with something citation-like.
+   PDFs are pinned by sha256 in `data/commentary_sources.json`.
+2. `propose` — the LLM (local Qwen by default) reads a page, footnotes
+   included, and returns `{proposition, question, cases}`. Automatic
+   rejections: a cited case not findable in the page text (invented
+   citation); a question that contains a citation, a case title or a cited
+   party's name; no cited case that resolves to a corpus judgment (same
+   `CitationResolver` as the citation graph, with a case-name fallback
+   because commentary cites SCC while JUDIS headers carry AIR/SCR).
+3. `review` — CSV for a law student: accept / reject / rewrite question.
+4. `finalize --version v1` — frozen `data/commentary_gold_v1.json`; never
+   regenerated in place.
+5. `commentary_eval.py` — judgment-level, every cited corpus case counts
+   as relevant: hit@k, recall@k (share of cited cases found), nDCG@k, MRR,
+   ranked over **distinct** judgments, with bootstrap 95% CIs and a
+   per-source breakdown. Validates judgment ids against stored case names
+   so a re-ingest can't silently mis-score.
+
+### How to run
+
+```bash
+cd NLPv2/backend
+python benchmark/commentary_gold.py extract                 # PDFs in <repo>/data/commentary/
+python benchmark/commentary_gold.py propose --max-pages 10  # trial; needs DB + GPU
+python benchmark/commentary_gold.py review                  # -> benchmark/work/commentary/review.csv
+python benchmark/commentary_gold.py finalize --version v1
+python benchmark/commentary_eval.py --gold benchmark/data/commentary_gold_v1.json
+python tests/smoke_test_commentary_gold.py                  # offline checks
+```
