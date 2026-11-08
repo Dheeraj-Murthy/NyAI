@@ -426,3 +426,33 @@ OR-ed tsquery (`to_tsquery` joined with `|`) ranked by `ts_rank_cd`.
 - A v2 builder should mask whole case titles including initials, cover
   more reporters, drop headnote-like passages and strip empty brackets.
   v1 stays frozen; build v2 alongside, never in place.
+
+## Update (2026-11-08): BM25 leg switched to an OR query (issue #12) — not yet measured
+
+The judgment BM25 leg (`retrieve_bm25_candidates`) now defaults to
+`bm25_mode="or"`: the query's stemmed, stopword-free lexemes (Postgres'
+own `english` config, so they match `content_tsv`) are OR-ed into a
+tsquery and ranked by `ts_rank_cd`. To keep it cheap, lexemes that occur in
+more than 5% of chunks are dropped (frequencies come from `pg_stats`
+`most_common_elems`, which ANALYZE already maintains — no new table), and at
+most 32 terms are kept, rarest first. If nothing survives, BM25 returns no
+candidates rather than matching every chunk. `bm25_mode="and"` keeps the old
+`plainto_tsquery` leg for ablations. Statute BM25 is unchanged (AND).
+
+Checked offline (`tests/smoke_test_bm25_or.py`) and against a scratch
+Postgres 16 with the real schema's `content_tsv` column; **not yet run on
+the corpus**. To measure (paired against the AND rows above):
+
+```bash
+cd NLPv2/backend
+for m in and or; do
+  python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --bm25-mode $m
+  python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --bm25-mode $m --query-field query_short
+  python benchmark/retrieval_eval.py --gold benchmark/data/gold_set.json --bm25-mode $m   # synthetic set: regression check
+done
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --retriever bm25
+```
+
+What to look for: hybrid stage-1 hit@30 above dense-only (0.346), the
+BM25-usable count well above 57/500, no drop on the synthetic set (where the
+AND leg was strong), and `bm25_mean_ms` acceptable for chat latency.

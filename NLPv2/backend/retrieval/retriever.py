@@ -29,6 +29,35 @@ _SECTION_STATUTES = [
 ]
 
 
+# BM25 leg query modes. "and" is plainto_tsquery: every query word must occur
+# in one chunk, so a passage-length query matches nothing except (for the
+# masked-citation benchmark) the chunk it was copied from — hybrid then ran
+# dense-only for 89% of passage queries (benchmark/REPORT.md). "or" matches a
+# chunk containing any query term and ranks by cover density (ts_rank_cd).
+BM25_MODES = ("and", "or")
+_TSQUERY_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# OR over a term found in most chunks ("court", "appeal") makes nearly every
+# chunk a match and ts_rank_cd has to score them all. Terms whose chunk
+# frequency in pg_stats exceeds this are dropped; at most _OR_MAX_TERMS
+# terms are kept, rarest first.
+_OR_MAX_DF = 0.05
+_OR_MAX_TERMS = 32
+
+
+def _select_or_terms(
+    lexemes: List[str], doc_freq: Dict[str, float], max_df: float, max_terms: int
+) -> List[str]:
+    """Keep query lexemes for an OR tsquery: drop ones in more than max_df of
+    chunks, then keep the max_terms rarest. A lexeme missing from pg_stats'
+    most-common list is rarer than all of them, so it sorts first; ties keep
+    query order."""
+    seen = set()
+    unique = [l for l in lexemes if not (l in seen or seen.add(l))]
+    kept = [l for l in unique if doc_freq.get(l, 0.0) <= max_df]
+    kept.sort(key=lambda l: doc_freq.get(l, 0.0))  # stable sort keeps query order
+    return kept[:max_terms]
+
+
 def _default_db_connection_string() -> str:
     """Build the default DSN from env vars, matching the docker-compose api
     service's DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD, so this also works
@@ -42,14 +71,21 @@ def _default_db_connection_string() -> str:
 
 
 class LegalRetriever:
+    bm25_mode = "or"
+    _chunk_doc_freq: Optional[Dict[str, float]] = None
+
     def __init__(
         self,
         db_connection_string: Optional[str] = None,
         graph_manager: Optional[Any] = None,
+        bm25_mode: str = "or",
     ):
+        if bm25_mode not in BM25_MODES:
+            raise ValueError(f"bm25_mode must be one of {BM25_MODES}, got {bm25_mode!r}")
         self.db_connection_string = db_connection_string or _default_db_connection_string()
         self.embedding_model = None
         self.graph_manager = graph_manager
+        self.bm25_mode = bm25_mode
         self._max_centrality: Optional[float] = None
         self._load_embedding_model()
 
@@ -394,18 +430,66 @@ class LegalRetriever:
             cur.close()
             conn.close()
 
+    def _or_query_terms(self, cur, query: str) -> List[str]:
+        """Stemmed, stopword-free lexemes of the query (Postgres' own
+        'english' config, so they match content_tsv), minus terms too common
+        to be worth an OR — see _OR_MAX_DF."""
+        words = " ".join(_TSQUERY_WORD_RE.findall(query))
+        if not words:
+            return []
+        cur.execute(
+            "SELECT lexeme FROM unnest(to_tsvector('english', %s)) ORDER BY positions[1]",
+            (words,),
+        )
+        lexemes = [row[0] for row in cur.fetchall()]
+        return _select_or_terms(lexemes, self._doc_freq(cur), _OR_MAX_DF, _OR_MAX_TERMS)
+
+    def _doc_freq(self, cur) -> Dict[str, float]:
+        """Share of judgment chunks containing each of the most common
+        lexemes, from the planner statistics ANALYZE already keeps for
+        content_tsv (no extra table). Fetched once per retriever; empty if
+        the table was never analysed, which only disables pruning."""
+        if self._chunk_doc_freq is None:
+            cur.execute(
+                """
+                SELECT most_common_elems::text::text[], most_common_elem_freqs
+                FROM pg_stats
+                WHERE tablename = 'judgment_chunks' AND attname = 'content_tsv'
+                  AND schemaname = ANY(current_schemas(false))
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            elems, freqs = (row or (None, None))
+            # freqs has three trailing entries (min, max, null frequency).
+            self._chunk_doc_freq = dict(zip(elems, freqs)) if elems and freqs else {}
+        return self._chunk_doc_freq
+
     def retrieve_bm25_candidates(
         self, query: str, candidate_k: int = 30
     ) -> List[Dict[str, Any]]:
         """Stage-1 retrieval (keyword leg): Postgres full-text search over
         judgment_chunks.content_tsv. Catches exact terms (statute numbers,
-        party names, section numbers) that dense embeddings can blur past."""
+        party names, section numbers) that dense embeddings can blur past.
+        bm25_mode "or" (default) matches any non-trivial query term; "and"
+        is the old plainto_tsquery behaviour, kept for ablations."""
         conn = psycopg2.connect(self.db_connection_string)
         cur = conn.cursor()
 
         try:
+            if self.bm25_mode == "and":
+                tsquery_sql, rank_fn, tsquery_arg = "plainto_tsquery('english', %s)", "ts_rank", query
+            else:
+                terms = self._or_query_terms(cur, query)
+                if not terms:
+                    return []
+                # Lexemes are already stemmed and alphanumeric; 'simple' keeps
+                # them as they are instead of stemming a second time.
+                tsquery_sql, rank_fn = "to_tsquery('simple', %s)", "ts_rank_cd"
+                tsquery_arg = " | ".join(terms)
             cur.execute(
-                """
+                f"""
+                WITH q AS (SELECT {tsquery_sql} AS tsq)
                 SELECT
                     jc.content,
                     j.petitioner,
@@ -415,14 +499,14 @@ class LegalRetriever:
                     jc.section,
                     jc.chunk_id,
                     jc.judgment_id,
-                    ts_rank(jc.content_tsv, plainto_tsquery('english', %s)) as bm25_score
-                FROM judgment_chunks jc
+                    {rank_fn}(jc.content_tsv, q.tsq) as bm25_score
+                FROM q, judgment_chunks jc
                 JOIN judgments j ON j.id = jc.judgment_id
-                WHERE jc.content_tsv @@ plainto_tsquery('english', %s)
+                WHERE jc.content_tsv @@ q.tsq
                 ORDER BY bm25_score DESC
                 LIMIT %s
             """,
-                (query, query, candidate_k),
+                (tsquery_arg, candidate_k),
             )
 
             results = cur.fetchall()

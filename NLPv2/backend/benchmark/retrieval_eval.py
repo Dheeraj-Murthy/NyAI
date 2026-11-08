@@ -205,6 +205,7 @@ def run_eval(
     graph_boost: float = 0.0,
     k_values: Sequence[int] = DEFAULT_K_VALUES,
     crowd_threshold: int = DEFAULT_CROWD_THRESHOLD,
+    bm25_mode: str = "or",
 ) -> Dict[str, Any]:
     records, gold_meta = load_gold_set(gold_path)
     k_values = sorted(set(k_values))
@@ -228,7 +229,7 @@ def run_eval(
     if graph_boost > 0:
         from retrieval.citation_graph import CitationGraphManager
         graph_manager = CitationGraphManager()
-    retriever = LegalRetriever(graph_manager=graph_manager)
+    retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode)
     reranker = CrossEncoderReranker()
 
     per_query = []
@@ -330,6 +331,7 @@ def run_eval(
             "threshold": threshold,
             "top_k": top_k,
             "graph_boost": graph_boost,
+            "bm25_mode": bm25_mode,
             "k_values": k_values,
             "crowd_threshold": crowd_threshold,
             "n_queries": len(valid_records),
@@ -408,12 +410,16 @@ def main() -> None:
         help=f"Min crowd_size (near-duplicate count) for a gold record to be bucketed "
         f"'high_crowd' in the discriminability-gate breakdown (default: {DEFAULT_CROWD_THRESHOLD})",
     )
+    parser.add_argument(
+        "--bm25-mode", choices=("and", "or"), default="or",
+        help="BM25 leg: 'or' (default, production) or 'and' (old plainto_tsquery)",
+    )
     args = parser.parse_args()
 
     k_values = [int(x) for x in args.k_values.split(",")]
     report = run_eval(
         args.gold, args.candidate_k, args.threshold, args.top_k, args.graph_boost, k_values,
-        crowd_threshold=args.crowd_threshold,
+        crowd_threshold=args.crowd_threshold, bm25_mode=args.bm25_mode,
     )
 
     output = args.output

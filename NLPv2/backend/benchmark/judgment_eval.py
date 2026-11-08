@@ -26,9 +26,10 @@ the list is cut back to candidate_k before reranking, approximating the
 corpus without them. Without this, the citing judgment's own chunk, which
 contains the query passage verbatim, would take rank 1 every time.
 
-Also reports how often BM25 returned nothing for the query: the BM25 leg
-uses plainto_tsquery, which ANDs every term, so long queries often match
-no chunk at all and hybrid retrieval silently becomes dense-only.
+Also reports how often BM25 returned no usable candidate (hybrid then runs
+dense-only) and BM25's mean latency. --bm25-mode and is the old
+plainto_tsquery leg, which ANDs every term, so long queries matched nothing
+but the citing judgment; or (default) matches any non-trivial term.
 
 Same two-stage retrieval and defaults as retrieval_eval.py
 (candidate_k=30, threshold=0.2, top_k=8).
@@ -142,6 +143,7 @@ def run_eval(
     overfetch: int = DEFAULT_OVERFETCH,
     limit: int = 0,
     retriever_mode: str = "hybrid",
+    bm25_mode: str = "or",
 ) -> Dict[str, Any]:
     import psycopg2
 
@@ -177,7 +179,7 @@ def run_eval(
     if graph_boost > 0:
         from retrieval.citation_graph import CitationGraphManager
         graph_manager = CitationGraphManager()
-    retriever = LegalRetriever(graph_manager=graph_manager)
+    retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode)
     reranker = CrossEncoderReranker()
 
     def first_stage(query: str, k: int) -> List[Dict[str, Any]]:
@@ -193,6 +195,7 @@ def run_eval(
     by_group: Dict[str, Dict[str, List]] = defaultdict(lambda: {"stage1": [], "stage2": []})
     per_query = []
     bm25_empty = 0
+    bm25_seconds = 0.0
     start = time.time()
     for r in valid:
         query = r[query_field]
@@ -204,7 +207,10 @@ def run_eval(
         # Count only BM25 candidates that survive the exclusion: a passage
         # query is verbatim from the citing judgment, so with AND-semantics
         # its own chunk is often the only match.
-        bm25_hits = len(exclude_and_cut(retriever.retrieve_bm25_candidates(query, candidate_k=fetch_k), exclude, 1))
+        t0 = time.time()
+        bm25_only = retriever.retrieve_bm25_candidates(query, candidate_k=fetch_k)
+        bm25_seconds += time.time() - t0
+        bm25_hits = len(exclude_and_cut(bm25_only, exclude, 1))
         bm25_empty += bm25_hits == 0
 
         ranked = {
@@ -238,6 +244,7 @@ def run_eval(
             "kind": kind,
             "query_field": query_field,
             "retriever": retriever_mode,
+            "bm25_mode": bm25_mode,
             "candidate_k": candidate_k,
             "threshold": threshold,
             "top_k": top_k,
@@ -249,6 +256,7 @@ def run_eval(
             "n_stale": len(stale),
             "n_partly_stale": sum(1 for r in valid if r["dropped_relevant"]),
             "n_bm25_empty": bm25_empty,
+            "bm25_mean_ms": round(1000 * bm25_seconds / len(valid), 1) if valid else None,
             "elapsed_s": round(elapsed, 2),
         },
         "gold_set": {**gold_meta, "current_judgment_count": judgment_count},
@@ -291,6 +299,8 @@ def main() -> None:
     parser.add_argument("--graph-boost", type=float, default=0.0)
     parser.add_argument("--retriever", choices=RETRIEVERS, default="hybrid",
                         help="Stage-1 retriever: hybrid (default, as in production), dense only or BM25 only")
+    parser.add_argument("--bm25-mode", choices=("and", "or"), default="or",
+                        help="BM25 leg: or (default, production) or and (old plainto_tsquery)")
     parser.add_argument("--overfetch", type=int, default=DEFAULT_OVERFETCH,
                         help="Stage-1 fetch multiplier when a record excludes judgments (default 2)")
     parser.add_argument("--k-values", default=",".join(str(k) for k in DEFAULT_K_VALUES))
@@ -301,7 +311,7 @@ def main() -> None:
     report = run_eval(
         args.gold, args.candidate_k, args.threshold, args.top_k, args.graph_boost,
         [int(k) for k in args.k_values.split(",")], args.query_field, args.overfetch, args.limit,
-        args.retriever,
+        args.retriever, args.bm25_mode,
     )
     cfg = report["config"]
     output = args.output or os.path.join(
@@ -320,7 +330,8 @@ def main() -> None:
         print("WARNING: gold set includes unreviewed records — trial-run numbers only.\n")
     print(f"Config: {cfg}\n")
     print(f"BM25 had no usable candidate for {cfg['n_bm25_empty']}/{cfg['n_queries']} queries "
-          "after excluding the citing judgment (hybrid ran dense-only for those).\n")
+          "after excluding the citing judgment (hybrid ran dense-only for those); "
+          f"BM25 mean latency {cfg['bm25_mean_ms']} ms.\n")
     for stage, label in (("stage1", f"Stage 1 ({cfg['retriever']}, no reranker)"), ("stage2", "Stage 2 (reranked, final)")):
         print(f"{label}:")
         for k, v in report[f"aggregate_{stage}"].items():
