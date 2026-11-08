@@ -7,6 +7,7 @@ Run: cd NLPv2/backend && python tests/smoke_test_masked_citation.py
 """
 import os
 import sys
+import types
 
 _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _backend_dir)
@@ -157,10 +158,48 @@ def test_eval_helpers():
     print("✓ eval helpers passed")
 
 
+def test_graph_boost_scaling():
+    print("--- Testing graph-boost PageRank rescaling ---")
+    # The retriever imports these at module level; stub them only if absent.
+    for name in ("psycopg2", "sentence_transformers"):
+        if name not in sys.modules:
+            try:
+                __import__(name)
+            except ImportError:
+                stub = types.ModuleType(name)
+                stub.SentenceTransformer = object
+                sys.modules[name] = stub
+    from retrieval.retriever import LegalRetriever
+
+    class Graph:
+        calls = 0
+
+        def centrality_for(self, ids):
+            return {1: 0.005, 2: 0.0}
+
+        def get_centrality_scores(self):
+            Graph.calls += 1
+            return {1: 0.005, 2: 0.0, 3: 0.0025}
+
+    r = LegalRetriever.__new__(LegalRetriever)  # skip loading the encoder
+    r.graph_manager, r._max_centrality = Graph(), None
+    r.retrieve_candidate_chunks = lambda q, candidate_k, similarity_threshold: [
+        {"chunk_id": 20, "judgment_id": 2}, {"chunk_id": 10, "judgment_id": 1}]
+    r.retrieve_bm25_candidates = lambda q, candidate_k: []
+    assert [c["judgment_id"] for c in r.retrieve_judgment_candidates("q")] == [2, 1]
+    # Raw PageRank 0.005 would lift by 0.15%; rescaled it is the corpus max -> x1.3.
+    out = r.retrieve_judgment_candidates("q", graph_boost=0.3)
+    assert [c["judgment_id"] for c in out] == [1, 2] and out[0]["graph_centrality"] == 1.0
+    r.retrieve_judgment_candidates("q", graph_boost=0.3)
+    assert Graph.calls == 1  # corpus max fetched once
+    print("✓ graph-boost scaling passed")
+
+
 if __name__ == "__main__":
     test_text_helpers()
     test_masking()
     test_build_record()
     test_sampling()
     test_eval_helpers()
+    test_graph_boost_scaling()
     print("\nAll masked-citation smoke tests passed.")

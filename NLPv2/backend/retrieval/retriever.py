@@ -50,7 +50,16 @@ class LegalRetriever:
         self.db_connection_string = db_connection_string or _default_db_connection_string()
         self.embedding_model = None
         self.graph_manager = graph_manager
+        self._max_centrality: Optional[float] = None
         self._load_embedding_model()
+
+    def _centrality_max(self) -> float:
+        """Largest PageRank in the corpus, fetched once (graph stats only
+        change on re-ingestion)."""
+        if self._max_centrality is None:
+            scores = self.graph_manager.get_centrality_scores() if self.graph_manager else {}
+            self._max_centrality = max(scores.values(), default=0.0)
+        return self._max_centrality
 
     def _load_embedding_model(self):
         try:
@@ -505,6 +514,12 @@ class LegalRetriever:
                 )
             else:
                 centrality_map = self.graph_manager.get_centrality_scores()
+            # Raw PageRank sums to 1 over the corpus (max ~0.005 on 46k
+            # judgments), which made the boost a no-op; rescale to [0, 1] by
+            # the corpus maximum so graph_boost is the most-cited judgment's lift.
+            top = self._centrality_max()
+            if top > 0:
+                centrality_map = {j: s / top for j, s in centrality_map.items()}
 
         for key, score in rrf_scores.items():
             j_id = fused[key].get("judgment_id")

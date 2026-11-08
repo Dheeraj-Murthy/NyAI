@@ -375,5 +375,39 @@ compare configurations (paired), not as a standalone score.
 the boost was skipped (identical numbers at 0.0 and 0.3). Fixed: the
 evals now pass a `CitationGraphManager` when `--graph-boost > 0`. Note also
 that `judgment_graph_stats.pagerank` is raw PageRank (sums to 1 over the
-corpus), so `rrf * (1 + boost * pagerank)` is a near-zero change at any
-sensible boost unless the score is rescaled (e.g. divided by the max).
+corpus: max 0.0053, p99 0.00019, n = 46,453), so `rrf * (1 + boost *
+pagerank)` lifted even the most-cited judgment by 0.16% at boost 0.3.
+Fixed in `retriever.py`: centrality is divided by the corpus maximum, so
+`graph_boost` is the most-cited judgment's lift. Production is unaffected
+by default (`graph_boost` defaults to 0).
+
+**Retriever ablation** (`--retriever`; stage 1 = retriever alone, stage 2 =
++ reranker; passage queries):
+
+| Stage 1 | hit@8 alone | hit@8 + reranker | hit@30 |
+|---|---|---|---|
+| hybrid (production) | 0.238 | 0.200 | 0.346 |
+| dense only | 0.238 | 0.200 | 0.346 |
+| BM25 only | 0.000 | 0.000 | 0.000 |
+
+Hybrid equals dense to three decimals: **the BM25 leg contributes nothing
+for passage-length queries.** `plainto_tsquery` ANDs every term, and a
+masked passage is verbatim from the citing judgment, so the only chunks
+containing all of its words are the citing judgment's own — which the
+eval excludes. The earlier "BM25 empty: 89/500" figure counted before that
+exclusion and hid this; `judgment_eval.py` now counts usable candidates.
+In production the same AND-semantics means BM25 only fires for short
+queries whose every word co-occurs in one chunk. Candidate fix (#12): an
+OR-ed tsquery (`to_tsquery` joined with `|`) ranked by `ts_rank_cd`.
+
+**v1 query audit** (regex counts over the 500 frozen queries):
+- Identity leaks of a relevant case: ~9 (<2%), mostly initials the
+  ≥4-letter name-word rule misses ("A.R. case" → A.R. Antulay). Too few
+  to move the numbers.
+- Noise that does not leak the answer: stray `]` from partly masked
+  citations (110), unmasked reporters of other cases — JT, SCALE, LLJ,
+  Lab IC (≈30), SCR headnote text with pin cites `[227B-D]` / "referred
+  to." lists (≈13–24).
+- A v2 builder should mask whole case titles including initials, cover
+  more reporters, drop headnote-like passages and strip empty brackets.
+  v1 stays frozen; build v2 alongside, never in place.

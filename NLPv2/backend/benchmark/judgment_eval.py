@@ -201,7 +201,10 @@ def run_eval(
         stage1 = first_stage(query, fetch_k)
         stage1 = exclude_and_cut(stage1, exclude, candidate_k)
         stage2 = reranker.rerank(query, list(stage1), top_n=top_k)
-        bm25_hits = len(retriever.retrieve_bm25_candidates(query, candidate_k=1))
+        # Count only BM25 candidates that survive the exclusion: a passage
+        # query is verbatim from the citing judgment, so with AND-semantics
+        # its own chunk is often the only match.
+        bm25_hits = len(exclude_and_cut(retriever.retrieve_bm25_candidates(query, candidate_k=fetch_k), exclude, 1))
         bm25_empty += bm25_hits == 0
 
         ranked = {
@@ -316,8 +319,8 @@ def main() -> None:
     if gold.get("kind") == "commentary" and gold.get("n_reviewed", 0) < gold.get("n", 0):
         print("WARNING: gold set includes unreviewed records — trial-run numbers only.\n")
     print(f"Config: {cfg}\n")
-    print(f"BM25 returned nothing for {cfg['n_bm25_empty']}/{cfg['n_queries']} queries "
-          "(those ran dense-only).\n")
+    print(f"BM25 had no usable candidate for {cfg['n_bm25_empty']}/{cfg['n_queries']} queries "
+          "after excluding the citing judgment (hybrid ran dense-only for those).\n")
     for stage, label in (("stage1", f"Stage 1 ({cfg['retriever']}, no reranker)"), ("stage2", "Stage 2 (reranked, final)")):
         print(f"{label}:")
         for k, v in report[f"aggregate_{stage}"].items():
