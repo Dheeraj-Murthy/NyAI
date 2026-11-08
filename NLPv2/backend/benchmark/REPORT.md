@@ -692,3 +692,23 @@ Follow-up (not yet measured):
   "for/in/on/to/&".
 - The fill is skipped for queries with >30 distinct lexemes and uses ≤8
   terms (was 12).
+
+### Results after the follow-up (2026-11-09, server, b3ed2a2)
+
+| Set | AND, no lookup (before #12) | now (`and_or` + lookup) | BM25 latency |
+|---|---|---|---|
+| case lookup, all (n=648) | 0.397 | **0.903** [0.880, 0.924] | 146 ms |
+| — citation (63) | 0.730 | 0.968 | |
+| — full_name (197) | 0.376 | **1.000** | |
+| — question (197) | 0.396 | **1.000** | |
+| — party_name (191) | 0.309 | 0.681 | |
+| masked citation, passage | 0.200 | 0.200 | 95 ms (fill skipped 856/1000 calls) |
+| masked citation, `query_short` | 0.070 | 0.082 | 262 ms (140/882 fills timed out) |
+| AILA mapped (n=43) | 0.093 | 0.093 | 57 ms (fill skipped 86/86) |
+
+Lookup pinned 557/648 case-lookup queries (535 relevant); on the masked
+set it pinned 7/500 and AILA 1/43, none relevant (titles that survived
+masking / appear in fact descriptions) — a small cost of one result slot.
+Long queries are back to AND latency with no quality change. Remaining gap:
+party-name queries 0.681 vs 0.921 for the Graph search, which matches
+substrings of either party (we require an exact party side and ≤4 matches).
