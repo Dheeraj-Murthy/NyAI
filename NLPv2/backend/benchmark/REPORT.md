@@ -456,3 +456,40 @@ python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.
 What to look for: hybrid stage-1 hit@30 above dense-only (0.346), the
 BM25-usable count well above 57/500, no drop on the synthetic set (where the
 AND leg was strong), and `bm25_mean_ms` acceptable for chat latency.
+
+## Update (2026-11-08): case-name / citation lookup gold set (issue #11) — not yet run
+
+Users often just name the case they want ("Maneka Gandhi v. Union of
+India", "the Maneka Gandhi case", "AIR 1978 SC 597"). Chat retrieval has no
+lookup path for these: they go through dense + BM25 + reranker like any
+question. `case_lookup_gold.py` builds this set with no labelling — the
+answer is the judgment whose own header names those parties or carries that
+citation.
+
+- Four query variants per sampled judgment, scored as separate groups:
+  `full_name`, `question` ("What was held in X v. Y?"), `party_name`
+  (the rarer distinctive party + "case") and `citation` (from the JUDIS
+  `CITATION:` header or stored reporters, written as "AIR 1978 SC 597" /
+  "(1978) 2 SCR 621").
+- Relevant = every judgment the query names equally well (same normalised
+  case name, same party, same reporter key — connected appeals share one);
+  queries naming more than 5 judgments are dropped as unscoreable.
+- Upper-case JUDIS party names are re-cased as a user would type them.
+- `judgment_eval.py --retriever lookup` scores the Graph page's alias search
+  (`judgment_aliases`: reporter keys + trigram names) on the same set — the
+  ceiling a lookup route in chat could reach. It has no reranker stage.
+
+```bash
+cd NLPv2/backend
+python benchmark/case_lookup_gold.py --n 200 --seed 1 --version v1
+for m in and or; do python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --bm25-mode $m; done
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --retriever dense
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --retriever lookup
+python tests/smoke_test_case_lookup.py
+```
+
+Expectation to test: BM25 should matter most here (exact party names,
+reporter numbers), so this is also the set where the OR-query change can
+help or hurt most; dense is likely weak on bare citations. If `lookup`
+beats chat retrieval by a wide margin, routing name/citation queries in
+chat through the alias table is the obvious fix.

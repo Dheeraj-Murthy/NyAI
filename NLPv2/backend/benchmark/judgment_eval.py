@@ -7,6 +7,9 @@ Scores two kinds of gold set:
   masked_citation  masked_citation_gold.py: a passage from judgment A with
                    its citations masked; relevant = the cases A cites there.
                    A itself is excluded from the ranking (see below).
+  case_lookup      case_lookup_gold.py: a case name, a party name or a
+                   reporter citation; relevant = the judgment(s) it names.
+                   Broken down by query variant.
 
 Per stage, over DISTINCT judgments (retrieval returns chunks, and one case
 can fill several of the top 8, so stage 2 can hold fewer than 8 cases):
@@ -39,6 +42,7 @@ Usage:
     python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json
     python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --query-field query_short
     python benchmark/judgment_eval.py --gold benchmark/data/commentary_gold_v1.json
+    python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json [--retriever lookup]
 """
 import argparse
 import json
@@ -55,8 +59,11 @@ from graph.citation_resolver import case_name_alias  # noqa: E402
 from metrics import aggregate_multi, bootstrap_ci, dedupe, mrr, recall_at_k  # noqa: E402
 
 DEFAULT_K_VALUES = (1, 3, 5, 8, 10, 30)
-KINDS = ("commentary", "masked_citation")
-RETRIEVERS = ("hybrid", "dense", "bm25")
+KINDS = ("commentary", "masked_citation", "case_lookup")
+# lookup = the Graph page's case search (judgment_aliases: reporter keys and
+# trigram name match), not chat retrieval; it returns judgments, not chunks,
+# so it has no reranker stage (stage 2 = stage 1).
+RETRIEVERS = ("hybrid", "dense", "bm25", "lookup")
 DEFAULT_OVERFETCH = 2
 
 
@@ -85,6 +92,8 @@ def group_of(record: Dict[str, Any], kind: str) -> str:
     cited bucket and could hurt the rare one)."""
     if kind == "masked_citation":
         return in_degree_bucket(record.get("target_in_degree", 0))
+    if kind == "case_lookup":
+        return record.get("variant", "?")
     return record.get("source_id", "?")
 
 
@@ -161,6 +170,8 @@ def run_eval(
     k_values = sorted(set(k_values))
     if retriever_mode not in RETRIEVERS:
         raise SystemExit(f"--retriever must be one of {RETRIEVERS}")
+    if retriever_mode == "lookup" and kind != "case_lookup":
+        raise SystemExit("--retriever lookup only makes sense for a case_lookup gold set")
     if graph_boost > 0 and retriever_mode != "hybrid":
         raise SystemExit("--graph-boost only applies to --retriever hybrid")
 
@@ -176,7 +187,7 @@ def run_eval(
 
     # Without a graph manager the retriever silently ignores graph_boost.
     graph_manager = None
-    if graph_boost > 0:
+    if graph_boost > 0 or retriever_mode == "lookup":
         from retrieval.citation_graph import CitationGraphManager
         graph_manager = CitationGraphManager()
     retriever = LegalRetriever(graph_manager=graph_manager, bm25_mode=bm25_mode)
@@ -187,6 +198,8 @@ def run_eval(
             return retriever.retrieve_candidate_chunks(query, candidate_k=k, similarity_threshold=threshold)
         if retriever_mode == "bm25":
             return retriever.retrieve_bm25_candidates(query, candidate_k=k)
+        if retriever_mode == "lookup":
+            return [{"judgment_id": h["judgment_id"]} for h in graph_manager.search(query, limit=k)]
         return retriever.retrieve_judgment_candidates(
             query=query, candidate_k=k, similarity_threshold=threshold, graph_boost=graph_boost
         )
@@ -203,7 +216,10 @@ def run_eval(
         fetch_k = candidate_k * overfetch if exclude else candidate_k
         stage1 = first_stage(query, fetch_k)
         stage1 = exclude_and_cut(stage1, exclude, candidate_k)
-        stage2 = reranker.rerank(query, list(stage1), top_n=top_k)
+        if retriever_mode == "lookup":
+            stage2 = stage1[:top_k]
+        else:
+            stage2 = reranker.rerank(query, list(stage1), top_n=top_k)
         # Count only BM25 candidates that survive the exclusion: a passage
         # query is verbatim from the citing judgment, so with AND-semantics
         # its own chunk is often the only match.
@@ -298,7 +314,8 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--graph-boost", type=float, default=0.0)
     parser.add_argument("--retriever", choices=RETRIEVERS, default="hybrid",
-                        help="Stage-1 retriever: hybrid (default, as in production), dense only or BM25 only")
+                        help="Stage-1 retriever: hybrid (default, as in production), dense only, BM25 only, "
+                             "or lookup (Graph page case search; case_lookup sets only)")
     parser.add_argument("--bm25-mode", choices=("and", "or"), default="or",
                         help="BM25 leg: or (default, production) or and (old plainto_tsquery)")
     parser.add_argument("--overfetch", type=int, default=DEFAULT_OVERFETCH,
