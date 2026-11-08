@@ -267,7 +267,7 @@ people who never saw our chunks.
 
 Target: ~100–150 human-reviewed queries before quoting any number.
 
-### Pipeline (`commentary_gold.py`, `commentary_eval.py`)
+### Pipeline (`commentary_gold.py`, `judgment_eval.py`)
 
 1. `extract` — pdftotext per page, OCR (pdftoppm + tesseract) for pages
    with no text layer, cached; keep pages with something citation-like.
@@ -282,7 +282,7 @@ Target: ~100–150 human-reviewed queries before quoting any number.
 3. `review` — CSV for a law student: accept / reject / rewrite question.
 4. `finalize --version v1` — frozen `data/commentary_gold_v1.json`; never
    regenerated in place.
-5. `commentary_eval.py` — judgment-level, every cited corpus case counts
+5. `judgment_eval.py` — judgment-level, every cited corpus case counts
    as relevant: hit@k, recall@k (share of cited cases found), nDCG@k, MRR,
    ranked over **distinct** judgments, with bootstrap 95% CIs and a
    per-source breakdown. Validates judgment ids against stored case names
@@ -296,6 +296,44 @@ python benchmark/commentary_gold.py extract                 # PDFs in <repo>/dat
 python benchmark/commentary_gold.py propose --max-pages 10  # trial; needs DB + GPU
 python benchmark/commentary_gold.py review                  # -> benchmark/work/commentary/review.csv
 python benchmark/commentary_gold.py finalize --version v1
-python benchmark/commentary_eval.py --gold benchmark/data/commentary_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/commentary_gold_v1.json
 python tests/smoke_test_commentary_gold.py                  # offline checks
+```
+
+## Update (2026-11-08): masked-citation gold set — no human labelling (issue #11)
+
+Built ahead of the commentary set, because it needs no reviewer with a legal
+background: the ground truth is the judges' own citations.
+
+**Method** (`masked_citation_gold.py`): for a resolved `citation_edges` row
+A → B, take the paragraph of A around the citation (≤150 words; plus a
+40-word `query_short` variant), mask every citation, case title, "supra"
+and the identifying name words of each cited case, and ask retrieval to
+find B. Every corpus case cited within that window and masked is also
+relevant.
+
+**Guards**
+- Only `reporter` / `exact_name` resolutions; target not dated after source.
+- Citation must be in the body (after `JUDGMENT:`), never the JUDIS header,
+  whose `CITATOR INFO` lists *later* cases citing A.
+- Passages quoting B (>20% of 8-word shingles found in B) are dropped;
+  otherwise this collapses back into paraphrase lookup.
+- A is excluded from the ranking (`judgment_eval.py` over-fetches 2× and
+  drops it), since A's own chunk contains the passage verbatim.
+- One record per citing judgment, ≤2 per cited judgment; target in-degree
+  recorded, and results are split rarely-cited / 5–49 / 50+ — the bucket
+  where `--graph-boost` should help or hurt.
+
+**Diagnostic worth watching**: the BM25 leg uses `plainto_tsquery`, which
+ANDs every term, so passage-length queries likely match no chunk and
+hybrid retrieval silently becomes dense-only. `judgment_eval.py` reports
+how many queries had zero BM25 hits.
+
+```bash
+cd NLPv2/backend
+python benchmark/masked_citation_gold.py --n 500 --seed 1 --version v1
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --limit 20   # smoke run
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --query-field query_short
+python tests/smoke_test_masked_citation.py
 ```

@@ -73,7 +73,7 @@ def aggregate(
 
 
 # ---------------------------------------------------------------------------
-# Multi-relevant metrics (commentary_eval.py)
+# Multi-relevant metrics (judgment_eval.py)
 #
 # A commentary gold record cites several cases for one proposition, and
 # each of them is independently relevant, unlike the equivalence class

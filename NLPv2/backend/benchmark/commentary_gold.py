@@ -28,7 +28,7 @@ Stages (each reads the previous stage's file, so any one can be re-run):
   review    candidates.jsonl -> review.csv, for a law student to mark each
             row accept / reject and optionally rewrite the question.
   finalize  review.csv + candidates.jsonl -> the frozen gold set JSON that
-            commentary_eval.py scores against. Freeze it; never regenerate
+            judgment_eval.py scores against. Freeze it; never regenerate
             it in place, or runs stop being comparable.
 
 Usage:
@@ -620,7 +620,7 @@ def build_gold(
             "query": query,
             "proposition": c["proposition"],
             "relevant_judgment_ids": c["relevant_judgment_ids"],
-            # Case names let commentary_eval.py notice a re-ingest that
+            # Case names let judgment_eval.py notice a re-ingest that
             # reassigned judgment ids, instead of scoring against the wrong cases.
             "relevant_case_names": {str(x["judgment_id"]): x["case_name"] for x in c["cases"]},
             "source_id": c["source_id"],
