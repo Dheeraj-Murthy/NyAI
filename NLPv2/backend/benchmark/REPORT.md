@@ -381,6 +381,20 @@ Fixed in `retriever.py`: centrality is divided by the corpus maximum, so
 `graph_boost` is the most-cited judgment's lift. Production is unaffected
 by default (`graph_boost` defaults to 0).
 
+Re-run with the rescaled boost (passage queries):
+
+| graph_boost | Stage-1 hit@8 | Stage-1 hit@30 | Final hit@8 | Final hit@8, 50+ cited |
+|---|---|---|---|---|
+| 0 | 0.238 | 0.346 | 0.200 | 0.141 |
+| 0.1 | 0.240 | 0.348 | 0.200 | 0.141 |
+| 0.3 | 0.244 | 0.348 | 0.198 | 0.128 |
+
+No meaningful effect (±1–3 queries of 500). Two reasons: centrality is
+very skewed (p99 is 3.6% of the max), so almost every candidate gets ~no
+lift; and the cross-encoder re-scores from text alone, so the boost can
+only matter by changing which 30 candidates reach it (hit@30 +1 query).
+Graph boost is not a lever for this task in its current form.
+
 **Retriever ablation** (`--retriever`; stage 1 = retriever alone, stage 2 =
 + reranker; passage queries):
 
@@ -395,7 +409,8 @@ for passage-length queries.** `plainto_tsquery` ANDs every term, and a
 masked passage is verbatim from the citing judgment, so the only chunks
 containing all of its words are the citing judgment's own — which the
 eval excludes. The earlier "BM25 empty: 89/500" figure counted before that
-exclusion and hid this; `judgment_eval.py` now counts usable candidates.
+exclusion and hid this; counting usable candidates, BM25 contributes
+nothing for **443/500 (89%)** queries.
 In production the same AND-semantics means BM25 only fires for short
 queries whose every word co-occurs in one chunk. Candidate fix (#12): an
 OR-ed tsquery (`to_tsquery` joined with `|`) ranked by `ts_rank_cd`.
