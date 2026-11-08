@@ -55,6 +55,7 @@ from metrics import aggregate_multi, bootstrap_ci, dedupe, mrr, recall_at_k  # n
 
 DEFAULT_K_VALUES = (1, 3, 5, 8, 10, 30)
 KINDS = ("commentary", "masked_citation")
+RETRIEVERS = ("hybrid", "dense", "bm25")
 DEFAULT_OVERFETCH = 2
 
 
@@ -140,6 +141,7 @@ def run_eval(
     query_field: str = "query",
     overfetch: int = DEFAULT_OVERFETCH,
     limit: int = 0,
+    retriever_mode: str = "hybrid",
 ) -> Dict[str, Any]:
     import psycopg2
 
@@ -155,6 +157,10 @@ def run_eval(
     if missing:
         raise SystemExit(f"{len(missing)} record(s) have no '{query_field}' field, e.g. {missing[0]}")
     k_values = sorted(set(k_values))
+    if retriever_mode not in RETRIEVERS:
+        raise SystemExit(f"--retriever must be one of {RETRIEVERS}")
+    if graph_boost > 0 and retriever_mode != "hybrid":
+        raise SystemExit("--graph-boost only applies to --retriever hybrid")
 
     conn = psycopg2.connect(_default_db_connection_string())
     try:
@@ -174,6 +180,15 @@ def run_eval(
     retriever = LegalRetriever(graph_manager=graph_manager)
     reranker = CrossEncoderReranker()
 
+    def first_stage(query: str, k: int) -> List[Dict[str, Any]]:
+        if retriever_mode == "dense":
+            return retriever.retrieve_candidate_chunks(query, candidate_k=k, similarity_threshold=threshold)
+        if retriever_mode == "bm25":
+            return retriever.retrieve_bm25_candidates(query, candidate_k=k)
+        return retriever.retrieve_judgment_candidates(
+            query=query, candidate_k=k, similarity_threshold=threshold, graph_boost=graph_boost
+        )
+
     pairs: Dict[str, List[Tuple[List[int], List[int]]]] = {"stage1": [], "stage2": []}
     by_group: Dict[str, Dict[str, List]] = defaultdict(lambda: {"stage1": [], "stage2": []})
     per_query = []
@@ -183,9 +198,7 @@ def run_eval(
         query = r[query_field]
         exclude = r.get("exclude_judgment_ids", [])
         fetch_k = candidate_k * overfetch if exclude else candidate_k
-        stage1 = retriever.retrieve_judgment_candidates(
-            query=query, candidate_k=fetch_k, similarity_threshold=threshold, graph_boost=graph_boost
-        )
+        stage1 = first_stage(query, fetch_k)
         stage1 = exclude_and_cut(stage1, exclude, candidate_k)
         stage2 = reranker.rerank(query, list(stage1), top_n=top_k)
         bm25_hits = len(retriever.retrieve_bm25_candidates(query, candidate_k=1))
@@ -221,6 +234,7 @@ def run_eval(
         "config": {
             "kind": kind,
             "query_field": query_field,
+            "retriever": retriever_mode,
             "candidate_k": candidate_k,
             "threshold": threshold,
             "top_k": top_k,
@@ -272,6 +286,8 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.2)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--graph-boost", type=float, default=0.0)
+    parser.add_argument("--retriever", choices=RETRIEVERS, default="hybrid",
+                        help="Stage-1 retriever: hybrid (default, as in production), dense only or BM25 only")
     parser.add_argument("--overfetch", type=int, default=DEFAULT_OVERFETCH,
                         help="Stage-1 fetch multiplier when a record excludes judgments (default 2)")
     parser.add_argument("--k-values", default=",".join(str(k) for k in DEFAULT_K_VALUES))
@@ -282,6 +298,7 @@ def main() -> None:
     report = run_eval(
         args.gold, args.candidate_k, args.threshold, args.top_k, args.graph_boost,
         [int(k) for k in args.k_values.split(",")], args.query_field, args.overfetch, args.limit,
+        args.retriever,
     )
     cfg = report["config"]
     output = args.output or os.path.join(
@@ -301,7 +318,7 @@ def main() -> None:
     print(f"Config: {cfg}\n")
     print(f"BM25 returned nothing for {cfg['n_bm25_empty']}/{cfg['n_queries']} queries "
           "(those ran dense-only).\n")
-    for stage, label in (("stage1", "Stage 1 (hybrid recall)"), ("stage2", "Stage 2 (reranked, final)")):
+    for stage, label in (("stage1", f"Stage 1 ({cfg['retriever']}, no reranker)"), ("stage2", "Stage 2 (reranked, final)")):
         print(f"{label}:")
         for k, v in report[f"aggregate_{stage}"].items():
             print(f"  {k}: {v:.3f}")
@@ -322,6 +339,7 @@ def main() -> None:
         params={
             "gold_version": gold.get("version"),
             "query_field": args.query_field,
+            "retriever": args.retriever,
             "candidate_k": args.candidate_k,
             "threshold": args.threshold,
             "top_k": args.top_k,
