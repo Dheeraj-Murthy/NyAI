@@ -554,3 +554,74 @@ python benchmark/aila_benchmark.py export --version v1
 python benchmark/judgment_eval.py --gold benchmark/data/aila_gold_v1.json
 python tests/smoke_test_aila.py
 ```
+
+## Results (2026-11-09, server): BM25 OR mode, case lookup, AILA
+
+### BM25 AND vs OR (issue #12) — final hit@8 unless noted
+
+| Set | AND | OR | BM25 latency AND → OR |
+|---|---|---|---|
+| masked citation, passage (n=500) | 0.200 [0.166, 0.236] | 0.242 [0.206, 0.280] | 45 ms → **3,667 ms** |
+| masked citation, `query_short` | 0.070 | 0.078 | 32 ms → 776 ms |
+| synthetic set, judgment recall@8 (n=80) | 0.625 | 0.650 | — |
+| case lookup, all (n=648) | **0.397** | 0.309 | 21 ms → 478 ms |
+| case lookup, citation (n=63) | **0.730** | **0.016** | |
+| case lookup, party name (n=191) | **0.309** | 0.225 | |
+
+- OR gives BM25 candidates for every passage query (usable for 500/500 vs
+  57/500) and the reranker stops hurting there (stage 1 0.220 → final
+  0.242), but the gain is within overlapping CIs.
+- **OR breaks citation lookup**: in "AIR 1978 SC 597" the terms `air`,
+  `sc`, `1978` exceed the 5% chunk-frequency cut, leaving `597` alone;
+  AND's requirement that all four co-occur is what made citations work.
+- Latency rules OR out as the default regardless: 3.7 s per BM25 call on
+  passage queries, ~0.5 s on short ones.
+- **Not merged as is.** Next: AND first, fill remaining slots from a
+  narrower OR (max_df ~1%, ~12 terms) under a statement timeout.
+
+### Case-name / citation lookup v1 (issue #11) — final hit@8, n=648
+
+| Retriever | all | citation | full_name | party_name | question |
+|---|---|---|---|---|---|
+| hybrid (production, AND) | 0.397 | 0.730 | 0.376 | 0.309 | 0.396 |
+| dense only | 0.261 | 0.048 | 0.350 | 0.110 | 0.386 |
+| **Graph alias lookup** | **0.977** | **1.000** | **1.000** | **0.921** | **1.000** |
+
+Builder: 200 judgments → 648 records (137 judgments had no reporter
+citation, 9 party names and 3 titles named >5 judgments).
+
+Chat finds a case the user names in the top 8 only 40% of the time; the
+alias table already in the codebase does it 98% of the time, including
+"What was held in X v. Y?". Routing queries that contain a resolvable
+citation or case title through the alias table is the largest gain any
+benchmark here has shown. BM25 (AND) carries citation queries — dense
+alone gets 5%.
+
+### AILA 2019 precedent retrieval, AILA pool, test Q11–50 (issue #15)
+
+| Run | MAP | P@10 | BPREF | RR |
+|---|---|---|---|---|
+| BM25 | **0.1333** | 0.0575 | 0.1160 | 0.2557 |
+| BGE dense | 0.0598 | 0.0350 | 0.0312 | 0.1130 |
+| hybrid (RRF) | 0.1059 | 0.0525 | 0.0860 | 0.2217 |
+| hybrid + MiniLM rerank | 0.0859 | 0.0350 | 0.0614 | 0.1896 |
+| best 2019 run | 0.1492 | 0.0700 | 0.1286 | 0.288 |
+
+Dense retrieval is weak on these 300–600-word fact situations (BGE
+truncates at 512 tokens and is not legal-domain), fusing it pulls BM25
+down, and the MS MARCO reranker lowers MAP again — the same direction as on
+the masked-citation passages. Our production stack (hybrid + rerank) is
+below plain BM25 on AILA.
+
+**Mapped onto the corpus** (`export --version v1`): 1,101 / 2,914 AILA
+cases map by exact name (591 fuzzy and 116 ambiguous left out), 102 / 186
+relevant cases; 43 queries keep at least one. Production retrieval:
+final hit@8 0.093 [0.023, 0.186], MRR 0.063; BM25 (AND) had no usable
+candidate for 41/43 queries. Too few queries for more than a sanity check.
+
+### Pattern across the four sets
+
+- Long, situation-style queries: BM25 (when it can fire) > hybrid > dense;
+  the MiniLM reranker hurts.
+- Short, name/citation queries: AND-BM25 is essential, the reranker helps
+  a little, and a direct alias lookup beats everything.
