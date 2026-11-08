@@ -337,3 +337,43 @@ python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.
 python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --query-field query_short
 python tests/smoke_test_masked_citation.py
 ```
+
+### Results v1 (2026-11-08, n=500, seed 1, candidate_k=30, top_k=8)
+
+| Query | Stage-1 hit@8 | Final hit@8 | Final MRR | Stage-1 hit@30 | BM25 empty |
+|---|---|---|---|---|---|
+| `query` (≤150 words) | 0.238 [0.202, 0.274] | **0.200** [0.166, 0.236] | 0.092 [0.073, 0.113] | 0.346 | 89 (18%) |
+| `query_short` (40 words) | 0.076 [0.054, 0.100] | **0.070** [0.048, 0.092] | 0.038 | 0.126 | 27 (5%) |
+
+95% bootstrap CIs in brackets. Builder: 128,912 eligible edges → 500
+records; 178 have more than one relevant judgment.
+
+**Findings**
+- **First-stage recall is the bottleneck.** The cited judgment is absent
+  from the top 30 candidates for 65% of passage queries. Raising
+  `candidate_k` to 60 moves stage-1 hit@30 only 0.346 → 0.356 and final
+  hit@8 not at all, so the answer is not just below the cut-off.
+- **The reranker hurts on this task.** Paired on the same 500 queries
+  (passage), reranking lost the hit for 37 queries and gained it for 18:
+  McNemar p = 0.014. For `query_short` it is 8 vs 5, p = 0.58 (no effect).
+  MiniLM was trained on MS MARCO question→passage; a judge's argument →
+  precedent is a different relation.
+- **BM25 emptiness is not the main cause.** Final hit@8 is 0.169 when BM25
+  returned nothing vs 0.207 otherwise (passage) — a small gap.
+- **Heavily cited judgments are hardest**: hit@8 0.141 (in-degree 50+,
+  n=78) vs 0.210 (5–49) and 0.215 (<5). Landmark cases are cited for many
+  propositions, so no single passage resembles their text.
+- **Short queries are much harder** — relevant because real user queries
+  are short.
+
+**Caveat.** Other judgments stating the same rule are valid answers but
+unlabelled, so absolute numbers understate quality. Use this set to
+compare configurations (paired), not as a standalone score.
+
+**`--graph-boost` was a no-op in these runs.** `judgment_eval.py` and
+`retrieval_eval.py` built `LegalRetriever()` without a graph manager, so
+the boost was skipped (identical numbers at 0.0 and 0.3). Fixed: the
+evals now pass a `CitationGraphManager` when `--graph-boost > 0`. Note also
+that `judgment_graph_stats.pagerank` is raw PageRank (sums to 1 over the
+corpus), so `rrf * (1 + boost * pagerank)` is a near-zero change at any
+sensible boost unless the score is rescaled (e.g. divided by the max).

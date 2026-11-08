@@ -166,7 +166,12 @@ def run_eval(
     finally:
         conn.close()
 
-    retriever = LegalRetriever()
+    # Without a graph manager the retriever silently ignores graph_boost.
+    graph_manager = None
+    if graph_boost > 0:
+        from retrieval.citation_graph import CitationGraphManager
+        graph_manager = CitationGraphManager()
+    retriever = LegalRetriever(graph_manager=graph_manager)
     reranker = CrossEncoderReranker()
 
     pairs: Dict[str, List[Tuple[List[int], List[int]]]] = {"stage1": [], "stage2": []}
