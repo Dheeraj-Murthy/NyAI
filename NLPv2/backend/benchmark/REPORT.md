@@ -712,3 +712,35 @@ masking / appear in fact descriptions) — a small cost of one result slot.
 Long queries are back to AND latency with no quality change. Remaining gap:
 party-name queries 0.681 vs 0.921 for the Graph search, which matches
 substrings of either party (we require an exact party side and ≤4 matches).
+
+### Party-name lookup rewrite and 200 ms fill (2026-11-10, server, d288351)
+
+Changes: "<Name> case" now tries every run of up to 12 normalised words
+before "case" against the aliases' party sides, longest first (the old
+capitalised-words regex lost names with commas, brackets, "A." initials or
+more than six words); the pin cap is 5 (was 4; the gold set keeps queries
+with up to 5 relevant judgments); spans ending in "present", "prosecution",
+"appellant's" etc. are skipped. The OR fill timeout went from 500 to 200 ms.
+
+| Set | b3ed2a2 | d288351 | BM25 latency (b3ed2a2 → d288351) |
+|---|---|---|---|
+| case lookup, all (n=648) | 0.903 | **0.921** [0.900, 0.941] | 146 → 116 ms |
+| — citation (63) | 0.968 | 0.968 | |
+| — full_name (197) | 1.000 | 1.000 | |
+| — question (197) | 1.000 | 1.000 | |
+| — party_name (191) | 0.681 | **0.743** | |
+| case lookup, lookup off | 0.491 | 0.491 | |
+| masked citation, passage | 0.200 | 0.198 | 95 → 70 ms |
+| masked citation, `query_short` | 0.082 | 0.072 [0.050, 0.096] | 262 → 166 ms (fill timeouts 140 → 471 of 882) |
+| synthetic, judgment recall@8 | 0.662 (35f5d61) | 0.637 | (fill timeouts 35/77) |
+| AILA mapped (n=43) | 0.093 | 0.093 | 57 ms (fill skipped 86/86) |
+
+- Lookup pinned 569/648 case-lookup queries, 567 of them relevant (was
+  557 / 535), so the longer party runs pin more and more precisely. On the
+  masked set it pinned 8/500 (passage) and 2/500 (short), AILA 1/43; none
+  relevant, as before.
+- Party-name queries are still 0.743 against 0.921 for the Graph search.
+- The 200 ms timeout more than tripled the fill timeouts. Short queries
+  lost about the gain the fill had brought (0.082 → 0.072; AND-only was
+  0.070) and synthetic judgment recall fell 0.662 → 0.637, both within
+  the CIs, for ~100 ms less BM25 time per call.
