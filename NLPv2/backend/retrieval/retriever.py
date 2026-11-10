@@ -59,7 +59,10 @@ _FILL_MAX_DF, _FILL_MAX_TERMS = 0.01, 8
 # 2026-11-09 server run its fill timed out 856/990 times (AILA: 86/86), adding
 # ~0.5 s for nothing, so the fill is skipped for it.
 _FILL_MAX_QUERY_LEXEMES = 30
-_FILL_TIMEOUT_MS = 500
+# 2026-11-09: at 500 ms, 140/882 short-query fills timed out and short
+# queries averaged 262 ms in BM25; the fill lifted their hit@8 only
+# 0.070 -> 0.082, so it gets less time.
+_FILL_TIMEOUT_MS = 200
 _QUERY_CANCELED = "57014"  # Postgres SQLSTATE for statement_timeout
 
 # Case lookup: a judgment the query names by reporter citation or "X v. Y"
@@ -67,10 +70,13 @@ _QUERY_CANCELED = "57014"  # Postgres SQLSTATE for statement_timeout
 # chat found a named case in its top 8 40% of the time; the alias table 98%).
 # Only the resolver's high-precision methods are trusted.
 _LOOKUP_METHODS = ("reporter", "exact_name")
-# "the Maneka Gandhi case": capitalised words right before "case".
-_NAMED_CASE_RE = re.compile(
-    r"((?:[A-Z][\w.'\u2019&/-]*\s+(?:(?:of|and|the|for|in|on|to|&)\s+)?){1,6})[Cc]ase\b"
-)
+# "the Maneka Gandhi case": the party is some trailing run of the words before
+# "case". Each run of up to _PARTY_MAX_TOKENS words is tried against the
+# aliases' party sides, longest first (names keep commas, brackets and "A."
+# initials, and some run past six words).
+_CASE_WORD_RE = re.compile(r"\bcase\b", re.I)
+_PARTY_MAX_TOKENS = 12
+_LOOKUP_MAX_SPANS = 3  # "case" occurrences tried per query
 _GENERIC_CASE_WORDS = frozenset(
     "this that present instant above said landmark famous which what the a an "
     "criminal civil bail murder dowry writ appeal constitutional leading "
@@ -78,7 +84,19 @@ _GENERIC_CASE_WORDS = frozenset(
     "is was are were did does do how why when where who explain describe summarise "
     "summarize tell discuss compare in see per under cf".split()
 )
-_LOOKUP_MAX_JUDGMENTS = 4  # a party name matching more is too ambiguous to pin
+# A party name doesn't start with these (single letters are initials: "A. K.").
+_NOT_PARTY_START = (_GENERIC_CASE_WORDS | {"of", "and", "v", "on", "to", "for", "by"}) - {"a"}
+# Nor ends with these: "the present case", "the prosecution case", "the
+# appellant's case" are about the case at hand, so no lookup is run for them.
+_NOT_PARTY_END = _GENERIC_CASE_WORDS | frozenset(
+    "s his her their its our my your own same such any every each other whole entire "
+    "prosecution defence defense appellant appellants respondent respondents petitioner "
+    "petitioners accused plaintiff plaintiffs defendant defendants complainant "
+    "of and v on to for by".split()
+)
+# A name matching more judgments is too ambiguous to pin. The case-lookup gold
+# set keeps queries with up to 5 relevant judgments (case_lookup_gold.py).
+_LOOKUP_MAX_JUDGMENTS = 5
 
 
 def _select_or_terms(
@@ -107,20 +125,34 @@ def _default_db_connection_string() -> str:
     return f"host={host} port={port} dbname={dbname} user={user} password={password}"
 
 
-def named_case_phrases(query: str) -> List[str]:
-    """Party names written as "<Name> case" ("the Maneka Gandhi case"), with
-    generic words ("this case", "the bail case") filtered out."""
-    out = []
-    for m in _NAMED_CASE_RE.finditer(query or ""):
-        tokens = normalize_case_name(m.group(1)).split()
-        while tokens and tokens[0] in _GENERIC_CASE_WORDS:
-            tokens.pop(0)
-        distinctive = [
-            t for t in tokens
-            if t not in _NAME_STOPWORDS and t not in _GENERIC_CASE_WORDS and len(t) > 2 and not t.isdigit()
-        ]
-        if distinctive:
-            out.append(" ".join(tokens))
+def named_case_phrases(query: str) -> List[List[str]]:
+    """For each "<Name> case" in the query (at most _LOOKUP_MAX_SPANS), the
+    party names it could be: the normalised runs of words ending just before
+    "case", longest first. Runs that start with a connective ("of punjab") or
+    have no distinctive word ("union of india") are dropped, and so is the
+    whole span when the word before "case" can't end a name ("this case",
+    "the bail case", "the prosecution case")."""
+    out: List[List[str]] = []
+    start = 0
+    for m in _CASE_WORD_RE.finditer(query or ""):
+        tokens = normalize_case_name(query[start:m.start()]).split()[-_PARTY_MAX_TOKENS:]
+        start = m.end()
+        if not tokens or tokens[-1] in _NOT_PARTY_END:
+            continue
+        candidates = []
+        for i in range(len(tokens)):
+            run = tokens[i:]
+            if run[0] in _NOT_PARTY_START:
+                continue
+            if any(
+                t not in _NAME_STOPWORDS and t not in _GENERIC_CASE_WORDS and len(t) > 2 and not t.isdigit()
+                for t in run
+            ):
+                candidates.append(" ".join(run))
+        if candidates:
+            out.append(candidates)
+            if len(out) == _LOOKUP_MAX_SPANS:
+                break
     return out
 
 
@@ -680,22 +712,32 @@ class LegalRetriever:
                     # the normalised query (as the Graph page search does).
                     for jid in self._contained_case_names(cur, norm):
                         found.setdefault(jid, "title_alias")
-                for name in ([] if found else phrases):
-                    esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    cur.execute(
-                        "SELECT DISTINCT judgment_id FROM judgment_aliases "
-                        "WHERE kind = 'case_name' AND (alias_norm LIKE %s OR alias_norm LIKE %s) "
-                        "LIMIT %s",
-                        (f"{esc} v %", f"% v {esc}", _LOOKUP_MAX_JUDGMENTS + 1),
-                    )
-                    ids = sorted(row[0] for row in cur.fetchall())
-                    if len(ids) <= _LOOKUP_MAX_JUDGMENTS:
-                        for jid in ids:
-                            found.setdefault(jid, "party_name")
+                for candidates in ([] if found else phrases):
+                    for jid in self._party_judgments(cur, candidates):
+                        found.setdefault(jid, "party_name")
             finally:
                 cur.close()
                 conn.close()
         return list(found.items())[:_LOOKUP_MAX_JUDGMENTS]
+
+    @staticmethod
+    def _party_judgments(cur, candidates: List[str]) -> List[int]:
+        """Judgments with the longest candidate party name that any alias has
+        on either side ("<name> v ..." or "... v <name>"). None when that
+        name is on more than _LOOKUP_MAX_JUDGMENTS judgments: a shorter run
+        isn't tried then, since the user named the longer one."""
+        for name in candidates:
+            esc = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            cur.execute(
+                "SELECT DISTINCT judgment_id FROM judgment_aliases "
+                "WHERE kind = 'case_name' AND (alias_norm LIKE %s OR alias_norm LIKE %s) "
+                "LIMIT %s",
+                (f"{esc} v %", f"% v {esc}", _LOOKUP_MAX_JUDGMENTS + 1),
+            )
+            ids = sorted(row[0] for row in cur.fetchall())
+            if ids:
+                return ids if len(ids) <= _LOOKUP_MAX_JUDGMENTS else []
+        return []
 
     @staticmethod
     def _contained_case_names(cur, norm_query: str) -> List[int]:

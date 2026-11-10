@@ -53,7 +53,8 @@ class FakeCursor:
         self.lexemes, self.stats = lexemes, stats
         self.contained = list(contained)  # (alias_norm, judgment_id) rows for the title fallback
         self.and_rows, self.or_rows, self.or_error = and_rows, or_rows, or_error
-        self.alias_ids = list(alias_ids)
+        # Party lookup rows: a list (any name) or {party name: ids}.
+        self.alias_ids = alias_ids if isinstance(alias_ids, dict) else list(alias_ids)
         self.executed, self._rows = [], []
 
     def execute(self, sql, params=None):
@@ -74,7 +75,10 @@ class FakeCursor:
             q = params[0]
             self._rows = [(a, j) for a, j in self.contained if f" {a} " in q]
         elif "DISTINCT judgment_id FROM judgment_aliases" in sql:
-            self._rows = [(j,) for j in self.alias_ids]
+            ids = self.alias_ids
+            if isinstance(ids, dict):
+                ids = ids.get(params[0][: -len(" v %")], [])
+            self._rows = [(j,) for j in list(ids)[: params[2]]]
         elif "DISTINCT ON (jc.judgment_id)" in sql:
             self._rows = [("pinned text", "P", "R", "SC", 1978, "ratio", 900 + j, j, 0.7) for j in params[1]]
         else:
@@ -185,7 +189,7 @@ def test_and_or_fill():
     assert "plainto_tsquery" in and_sql and "to_tsquery('simple'" in or_sql
     # 1% cut drops anticipatori (2%) and court; already-found chunk 7 skipped; only 2 slots left.
     assert or_p == ("dowri | bail", [7], 2)
-    assert any("SET LOCAL statement_timeout = 500" in s for s, _ in cur.executed)
+    assert any("SET LOCAL statement_timeout = 200" in s for s, _ in cur.executed)
     assert r.bm25_stats == {"calls": 1, "fills": 1}
 
     # AND already full: no fill query.
@@ -233,11 +237,23 @@ def test_lookup_extraction():
     assert lookup_strings("AIR 1978 SC 597") == ["AIR 1978 SC 597"]
     assert lookup_strings("What was held in Maneka Gandhi v. Union of India?") == ["Maneka Gandhi v Union of India"]
     assert lookup_strings("Is bail a right?") == []
-    assert named_case_phrases("Explain the Maneka Gandhi case") == ["maneka gandhi"]
-    assert named_case_phrases("Is the State of Punjab case relevant?") == ["state of punjab"]
-    assert named_case_phrases("the M/S. Tata Iron and Steel Co. Ltd. case") == ["tata iron and steel co ltd"]  # aliases keep "co ltd" too
-    for generic in ("Explain this case", "In the bail case of the accused", "The Constitutional case law"):
+    assert named_case_phrases("Explain the Maneka Gandhi case") == [["maneka gandhi", "gandhi"]]
+    assert named_case_phrases("Is the State of Punjab case relevant?") == [["state of punjab", "punjab"]]
+    assert named_case_phrases("the M/S. Tata Iron and Steel Co. Ltd. case")[0][0] == "tata iron and steel co ltd"  # aliases keep "co ltd" too
+    # Names the old capitalised-words regex lost: commas, brackets, "A." initials, > 6 words, lower case.
+    for query, name in (
+        ("The Commissioner of Income-tax, Bombay case", "commissioner of income tax bombay"),
+        ("K. S. Venkataraman & Co. (P) Ltd. case", "k s venkataraman and co p ltd"),
+        ("A.K. Gopalan case", "a k gopalan"),
+        ("The Board of Trustees of the Port of Bombay case", "board of trustees of port of bombay"),
+        ("what was held in maneka gandhi case", "maneka gandhi"),
+    ):
+        assert name in named_case_phrases(query)[0], (query, named_case_phrases(query))
+    for generic in ("Explain this case", "In the bail case of the accused", "The Constitutional case law",
+                    "the prosecution case is that the accused", "the facts of the present case",
+                    "the appellant's case was rejected", "Union of India case"):
         assert named_case_phrases(generic) == [], generic
+    assert len(named_case_phrases(" ".join(f"Name{i} Kumar case" for i in range(5)))) == 3  # span cap
     print("✓ extraction passed")
 
 
@@ -268,10 +284,31 @@ def test_lookup_and_pinning():
     r, _ = make_retriever("and", cur, FakeGraph({}))
     assert r.lookup_named_judgments("Explain the Maneka Gandhi case") == [(21, "party_name"), (22, "party_name")]
     _, params = next((s, p) for s, p in cur.executed if "judgment_aliases" in s)
-    assert params == ("maneka gandhi v %", "% v maneka gandhi", 5)
-    cur = FakeCursor([], None, [], [], alias_ids=range(30, 35))
+    assert params == ("maneka gandhi v %", "% v maneka gandhi", 6)
+    cur = FakeCursor([], None, [], [], alias_ids=range(30, 36))
     r, _ = make_retriever("and", cur, FakeGraph({}))
     assert r.lookup_named_judgments("the State of Punjab case") == []
+    # Five judgments (the gold set's max) are still pinned.
+    cur = FakeCursor([], None, [], [], alias_ids=range(30, 35))
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    assert [j for j, _ in r.lookup_named_judgments("the Sita Ram case")] == [30, 31, 32, 33, 34]
+    # Longest run that names anyone wins; shorter runs aren't tried after it.
+    cur = FakeCursor([], None, [], [], alias_ids={"sita ram": [61], "ram": [62]})
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    assert r.lookup_named_judgments("Explain the Sita Ram case") == [(61, "party_name")]
+    # A run that is too ambiguous blocks the shorter ones ("punjab" alone).
+    cur = FakeCursor([], None, [], [], alias_ids={"state of punjab": range(70, 80), "punjab": [81]})
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    assert r.lookup_named_judgments("the State of Punjab case") == []
+    # Comma in the party name, not found by the title regex.
+    cur = FakeCursor([], None, [], [], alias_ids={"commissioner of income tax bombay": [91]})
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    assert r.lookup_named_judgments("Explain The Commissioner of Income-tax, Bombay case") == [(91, "party_name")]
+    # "the present case" never reaches the alias table.
+    cur = FakeCursor([], None, [], [])
+    r, _ = make_retriever("and", cur, FakeGraph({}))
+    r.lookup_named_judgments("the facts of the present case")
+    assert not any("judgment_aliases" in s for s, _ in cur.executed)
 
     # Title the regex can't read (comma in a party name), resolver unresolved:
     # every full case name inside the normalised query, longest names only.
