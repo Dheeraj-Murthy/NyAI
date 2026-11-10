@@ -744,3 +744,47 @@ with up to 5 relevant judgments); spans ending in "present", "prosecution",
   lost about the gain the fill had brought (0.082 → 0.072; AND-only was
   0.070) and synthetic judgment recall fell 0.662 → 0.637, both within
   the CIs, for ~100 ms less BM25 time per call.
+
+### Role labels dropped from party names (2026-11-10, server, ea9c267)
+
+48 of the 49 party-name misses left after d288351 were judgments whose
+stored parties carry the newer Supreme Court header role labels
+("P.EKNATH ...Appellant(s)", "Ratan Lal .. Respondent"): their aliases read
+"p eknath appellant s v ...", so neither the lookup nor citation titles
+naming them could match. `normalize_case_name` now drops
+appellant/respondent/petitioner(s) at the end of a party,
+`clean_party_name` cuts "WITH CIVIL APPEAL NO. ..." tagged-matter notes,
+"<Name>'s case" is looked up as <Name>, and the fill timeout is back to
+500 ms. Aliases and edges were rebuilt (`build_citation_edges.py
+--rebuild`, `compute_graph_stats.py`):
+
+- aliases with a trailing role label: 19,344 judgments → 26
+- citation edges 491,855 → 493,621; 167,337 resolved (reporter 67,369,
+  exact name 71,036, fuzzy 28,932), 17,434 ambiguous, 308,850 unresolved;
+  110,819 distinct judgment-to-judgment links for PageRank
+
+| Set | d288351 | ea9c267 | BM25 latency (ea9c267) |
+|---|---|---|---|
+| case lookup, all | 0.921 (n=648) | **0.994** [0.988, 0.998] (n=642) | 143 ms (fill timeouts 24/1208) |
+| — citation | 0.968 | 0.968 | |
+| — full_name | 1.000 | 1.000 | |
+| — question | 1.000 | 1.000 | |
+| — party_name | 0.743 | **0.989** | |
+| masked citation, passage | 0.198 | 0.200 | 95 ms |
+| masked citation, `query_short` | 0.072 | **0.088** [0.064, 0.114] | 260 ms (fill timeouts 130/882) |
+| synthetic, judgment recall@8 | 0.637 | 0.650 | (fill timeouts 12/77) |
+| AILA mapped (n=43) | 0.093 | 0.093 | 57 ms |
+
+- Lookup pinned 629/642 case-lookup queries, every one relevant.
+- 6 case-lookup records were excluded as stale: the "WITH CIVIL APPEAL"
+  cut changed those judgments' case names beyond what re-normalising the
+  stored name recovers (e.g. the Moti Ratan Estate query). n is 642, not 648.
+- Pins on non-lookup sets: masked passage 13/500 (was 8), short 3/500,
+  AILA 1/43, none relevant. The extra passage pins come from names that
+  survive masking; hit@8 is unchanged.
+- BM25 returned something usable far more often (case lookup: no usable
+  candidate 124 → 9; short queries 210 → 73) with 500 ms back.
+
+Against the start of #12 (AND, no lookup): case lookup 0.397 → 0.994,
+`query_short` 0.070 → 0.088, passage and AILA unchanged, synthetic
+0.625 → 0.650.
