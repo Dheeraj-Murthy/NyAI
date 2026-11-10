@@ -59,10 +59,9 @@ _FILL_MAX_DF, _FILL_MAX_TERMS = 0.01, 8
 # 2026-11-09 server run its fill timed out 856/990 times (AILA: 86/86), adding
 # ~0.5 s for nothing, so the fill is skipped for it.
 _FILL_MAX_QUERY_LEXEMES = 30
-# 2026-11-09: at 500 ms, 140/882 short-query fills timed out and short
-# queries averaged 262 ms in BM25; the fill lifted their hit@8 only
-# 0.070 -> 0.082, so it gets less time.
-_FILL_TIMEOUT_MS = 200
+# 200 ms was tried (d288351): fill timeouts 140 -> 471/882 on short queries,
+# hit@8 0.082 -> 0.072, for ~100 ms less BM25 time; 500 ms kept.
+_FILL_TIMEOUT_MS = 500
 _QUERY_CANCELED = "57014"  # Postgres SQLSTATE for statement_timeout
 
 # Case lookup: a judgment the query names by reporter citation or "X v. Y"
@@ -75,6 +74,9 @@ _LOOKUP_METHODS = ("reporter", "exact_name")
 # aliases' party sides, longest first (names keep commas, brackets and "A."
 # initials, and some run past six words).
 _CASE_WORD_RE = re.compile(r"\bcase\b", re.I)
+# "Maneka Gandhi's case", "the respondents' case": a possessive before "case".
+_POSSESSIVE_RE = re.compile(r"(?<=\w)(?:['\u2019]s|(?<=s)['\u2019])\s*$", re.I)
+_ROLE_WORDS = frozenset("appellant appellants respondent respondents petitioner petitioners".split())
 _PARTY_MAX_TOKENS = 12
 _LOOKUP_MAX_SPANS = 3  # "case" occurrences tried per query
 _GENERIC_CASE_WORDS = frozenset(
@@ -135,8 +137,18 @@ def named_case_phrases(query: str) -> List[List[str]]:
     out: List[List[str]] = []
     start = 0
     for m in _CASE_WORD_RE.finditer(query or ""):
-        tokens = normalize_case_name(query[start:m.start()]).split()[-_PARTY_MAX_TOKENS:]
+        before = query[start:m.start()]
         start = m.end()
+        possessive = _POSSESSIVE_RE.search(before)
+        if possessive:
+            before = before[: possessive.start()]
+            # "the appellant's case" is the party's argument, not a case name.
+            # (A bare "...Appellant(s) case" is a header label, which
+            # normalize_case_name drops.)
+            last = re.findall(r"[a-z]+", before.lower())[-1:]
+            if last and last[0] in _ROLE_WORDS:
+                continue
+        tokens = normalize_case_name(before).split()[-_PARTY_MAX_TOKENS:]
         if not tokens or tokens[-1] in _NOT_PARTY_END:
             continue
         candidates = []

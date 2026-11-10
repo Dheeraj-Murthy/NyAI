@@ -189,7 +189,7 @@ def test_and_or_fill():
     assert "plainto_tsquery" in and_sql and "to_tsquery('simple'" in or_sql
     # 1% cut drops anticipatori (2%) and court; already-found chunk 7 skipped; only 2 slots left.
     assert or_p == ("dowri | bail", [7], 2)
-    assert any("SET LOCAL statement_timeout = 200" in s for s, _ in cur.executed)
+    assert any("SET LOCAL statement_timeout = 500" in s for s, _ in cur.executed)
     assert r.bm25_stats == {"calls": 1, "fills": 1}
 
     # AND already full: no fill query.
@@ -247,11 +247,14 @@ def test_lookup_extraction():
         ("A.K. Gopalan case", "a k gopalan"),
         ("The Board of Trustees of the Port of Bombay case", "board of trustees of port of bombay"),
         ("what was held in maneka gandhi case", "maneka gandhi"),
+        ("Maneka Gandhi's case", "maneka gandhi"),
+        ("P.EKNATH Appellant(s) case", "p eknath"),  # header role label dropped
+        ("Ratan Lal .. Respondent case", "ratan lal"),
     ):
         assert name in named_case_phrases(query)[0], (query, named_case_phrases(query))
     for generic in ("Explain this case", "In the bail case of the accused", "The Constitutional case law",
                     "the prosecution case is that the accused", "the facts of the present case",
-                    "the appellant's case was rejected", "Union of India case"):
+                    "the appellant's case was rejected", "the respondents' case", "Union of India case"):
         assert named_case_phrases(generic) == [], generic
     assert len(named_case_phrases(" ".join(f"Name{i} Kumar case" for i in range(5)))) == 3  # span cap
     print("✓ extraction passed")

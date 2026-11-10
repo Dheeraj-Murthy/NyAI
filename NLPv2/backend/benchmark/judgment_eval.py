@@ -57,7 +57,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _backend_dir)
 
-from graph.citation_resolver import case_name_alias  # noqa: E402
+from graph.citation_resolver import case_name_alias, normalize_case_name  # noqa: E402
 from metrics import aggregate_multi, bootstrap_ci, dedupe, mrr, recall_at_k  # noqa: E402
 
 DEFAULT_K_VALUES = (1, 3, 5, 8, 10, 30)
@@ -123,7 +123,9 @@ def validate_gold(records: List[Dict[str, Any]], conn) -> Tuple[List[Dict[str, A
             want = expected.get(str(jid))
             if jid not in live:
                 dropped.append({"judgment_id": jid, "reason": "judgment no longer exists"})
-            elif want and live[jid] != want:
+            # Re-normalising the stored name keeps records from before a
+            # normaliser change (e.g. role labels dropped) valid.
+            elif want and live[jid] not in (want, normalize_case_name(want)):
                 dropped.append({"judgment_id": jid, "reason": f"id now names '{live[jid]}', expected '{want}'"})
             else:
                 keep.append(jid)
