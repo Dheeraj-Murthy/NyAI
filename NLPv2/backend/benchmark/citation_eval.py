@@ -371,6 +371,10 @@ def run_eval(
     retriever = LegalRetriever(graph_manager=graph_manager) if graph_boost > 0.0 else LegalRetriever()
     reranker = CrossEncoderReranker() if rerank else None
     backend = _resolve_backend(model, external_ok, api_key) if llm != "none" else None
+    if backend is not None and hasattr(backend, "inference"):
+        # Local Qwen samples at temperature 0.9 by default (QwenInference);
+        # greedy decoding makes repeated runs on the same cases comparable.
+        backend.inference.do_sample = False
 
     pairs: Dict[str, List[Tuple[set, List[int]]]] = defaultdict(list)
     by_decade: Dict[str, List[Tuple[set, List[int]]]] = defaultdict(list)
