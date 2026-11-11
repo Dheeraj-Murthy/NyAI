@@ -242,3 +242,66 @@ there was effectively no gap left to close.
   benchmarking technique — bigger than either fix made in this update.
 - Corpus corruption re-scan (corrected non-ASCII threshold) is still
   outstanding, unrelated to the above.
+
+---
+
+## Citation benchmark (issue #19)
+
+A second benchmark, independent of the synthetic gold set above: does the
+system find the precedents real judgments actually cited? No LLM-written
+labels — the ground truth is the corpus's own citation graph.
+
+### Method
+
+- **Cases** (`generate_citation_set.py`): judgments that cite at least
+  `--min-gold` (default 3) other judgments that are also in the corpus,
+  sampled with `--seed`. Sampling is deterministic — same seed, corpus and
+  citation graph give the same cases, query text and gold ids, so the
+  reproducibility problem above doesn't apply here.
+- **Gold**: the case's resolved `citation_edges` targets (`reporter`,
+  `exact_name`, `fuzzy` by default; `--gold-methods reporter,exact_name`
+  for a smaller, higher-precision set). Targets dated after the case are
+  dropped as resolution errors.
+- **Query**: the case's own `facts`/`issues` chunks (up to 4), with every
+  reporter citation and case title redacted using the same patterns edge
+  building extracts with. Each chunk is retrieved separately and the
+  judgment rankings are fused with RRF.
+- **Leakage controls**: the case itself and every judgment decided after it
+  are dropped from every ranked list.
+- **Systems scored on the same cases** (`citation_eval.py`):
+  - retrieval, stage 1 (hybrid) and stage 2 (reranked over the full pool,
+    not cut to 8);
+  - popularity baseline — most-cited judgments before the case, ignoring
+    its text;
+  - `--llm select` — the LLM picks precedents from the top
+    `--select-pool` retrieved, compared with the retrieval list cut to the
+    same length;
+  - `--llm closed_book` — the LLM names precedents from memory, resolved to
+    judgment ids; `unresolved_rate` is the share of names that don't
+    resolve (hallucinations, plus real cases outside the corpus).
+- **Metrics**: multi-relevant recall@k, precision@k, hit@k, MAP@k, nDCG@k,
+  MRR, and `pool_recall` (recall over the whole candidate pool — the
+  ceiling for any reranker). Broken down by decade and by number of gold
+  precedents. `measurable_share` reports how much of everything cited
+  resolved into the corpus at all.
+
+### Caveats
+
+- Gold is a lower bound on "correct": a precedent the court could have
+  cited but didn't scores as a miss, so absolute precision is pessimistic.
+  Compare configurations against each other and the baseline.
+- `--graph-boost` and the popularity baseline use graph statistics that
+  include the case's own outgoing edges — a slight upward bias.
+- Redaction catches formal citations and full titles, not short-form
+  references ("in Kesavananda's case", "supra"), which can still leak.
+
+### How to run
+
+```bash
+cd NLPv2/backend
+python benchmark/generate_citation_set.py --n 100 --seed 42
+python benchmark/citation_eval.py --cases benchmark/data/citation_set.json
+python benchmark/citation_eval.py --cases benchmark/data/citation_set.json --llm both
+```
+
+Results: not run yet.
