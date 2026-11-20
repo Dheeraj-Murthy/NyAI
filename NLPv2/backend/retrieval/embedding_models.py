@@ -17,7 +17,7 @@ without Postgres.
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 ENV_VAR = "RAG_EMBEDDING_MODEL"
 BASELINE = "bge"
@@ -72,18 +72,94 @@ class EmbeddingSpec:
         return caller_threshold if self.dense_threshold is None else self.dense_threshold
 
 
-def _registry() -> Dict[str, EmbeddingSpec]:
-    """Built on each call so env overrides (model path, dims) are read late."""
-    specs = [
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not an integer")
+
+
+def _instruct_prompt(env_name: str) -> Optional[str]:
+    """Qwen3-Embedding's query format with a task of our own (env), or None
+    for the model's own query prompt from its sentence-transformers config."""
+    task = os.environ.get(env_name)
+    return f"Instruct: {task}\nQuery:" if task else None
+
+
+QWEN_KEYS = ("euler", "qwen3_8b", "qwen3_06b")
+
+
+def _qwen_specs() -> List[EmbeddingSpec]:
+    """Qwen3-Embedding family. Built apart from the rest so a bad env value
+    here (EULER_DIM=abc) fails only these models, never the baseline."""
+    # The 8B models output 4,096 dims; HNSW indexes at most 4,000 (halfvec),
+    # so they are stored Matryoshka-truncated. EULER_DIM sets the width for
+    # both 8B models (tables are named by it, so widths never share a table).
+    dim_8b = _env_int("EULER_DIM", 2048)
+    vtype_8b = "halfvec" if dim_8b > 2000 or os.environ.get("EULER_HALFVEC", "1") == "1" else "vector"
+    big = dict(max_seq_length=1536, dtype="bfloat16", dense_threshold=-1.0, query_prompt=None, document_prompt=None)
+    return [
+        # Euler-Legal-Embedding-V1: a LoRA legal fine-tune of
+        # Qwen3-Embedding-8B (last-token pooling, 1536 tokens). Unverified
+        # third-party upload: pin EULER_REVISION to a commit after reviewing
+        # the repo. trust_remote_code stays off unless EULER_TRUST_REMOTE_CODE=1
+        # (Qwen3 loads natively in recent transformers).
         EmbeddingSpec(
+            key="euler",
+            model_id=os.environ.get("EULER_MODEL", "Mira190/Euler-Legal-Embedding-V1"),
+            revision=os.environ.get("EULER_REVISION") or None,
+            trust_remote_code=os.environ.get("EULER_TRUST_REMOTE_CODE") == "1",
+            dim=dim_8b,
+            vector_type=vtype_8b,
+            judgment_table=f"judgment_embeddings_euler_{dim_8b}",
+            statute_table=f"statute_embeddings_euler_{dim_8b}",
+            **{**big, "query_prompt": _instruct_prompt("QWEN_QUERY_INSTRUCT")},
+        ),
+        # Control: the base model Euler was fine-tuned from. Euler minus this
+        # is what the legal fine-tune adds.
+        EmbeddingSpec(
+            key="qwen3_8b",
+            model_id="Qwen/Qwen3-Embedding-8B",
+            revision=os.environ.get("QWEN3_8B_REVISION") or None,
+            dim=dim_8b,
+            vector_type=vtype_8b,
+            judgment_table=f"judgment_embeddings_qwen3_8b_{dim_8b}",
+            statute_table=f"statute_embeddings_qwen3_8b_{dim_8b}",
+            **{**big, "query_prompt": _instruct_prompt("QWEN_QUERY_INSTRUCT")},
+        ),
+        # Light option: same family, 0.6B, 1,024 dims (fits vector + HNSW as is).
+        EmbeddingSpec(
+            key="qwen3_06b",
+            model_id="Qwen/Qwen3-Embedding-0.6B",
+            revision=os.environ.get("QWEN3_06B_REVISION") or None,
+            dim=_env_int("QWEN3_06B_DIM", 1024),
+            judgment_table=f"judgment_embeddings_qwen3_06b_{_env_int('QWEN3_06B_DIM', 1024)}",
+            statute_table=f"statute_embeddings_qwen3_06b_{_env_int('QWEN3_06B_DIM', 1024)}",
+            **{**big, "query_prompt": _instruct_prompt("QWEN_QUERY_INSTRUCT")},
+        ),
+    ]
+
+
+def _registry() -> Dict[str, Any]:
+    """key -> spec, or the ValueError that building it raised. Built on each
+    call so env overrides (model path, dims) are read late."""
+    specs: Dict[str, Any] = {
+        BASELINE: EmbeddingSpec(
             key=BASELINE,
             model_id="BAAI/bge-base-en-v1.5",
             dim=768,
             judgment_table="judgment_embeddings",
             statute_table="statute_embeddings",
         ),
-    ]
-    return {s.key: s for s in specs}
+    }
+    try:
+        specs.update({s.key: s for s in _qwen_specs()})
+    except ValueError as e:
+        specs.update({k: e for k in QWEN_KEYS})
+    return specs
 
 
 def available() -> List[str]:
@@ -95,6 +171,8 @@ def get_spec(key: Optional[str] = None) -> EmbeddingSpec:
     reg = _registry()
     if key not in reg:
         raise ValueError(f"unknown embedding model {key!r} ({ENV_VAR}); choose from {sorted(reg)}")
+    if isinstance(reg[key], ValueError):
+        raise ValueError(f"embedding model {key!r} is misconfigured: {reg[key]}")
     return reg[key]
 
 

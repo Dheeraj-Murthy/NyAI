@@ -788,3 +788,55 @@ appellant/respondent/petitioner(s) at the end of a party,
 Against the start of #12 (AND, no lookup): case lookup 0.397 → 0.994,
 `query_short` 0.070 → 0.088, passage and AILA unchanged, synthetic
 0.625 → 0.650.
+
+## Update (2026-11-20): other embedding models, alongside the BGE baseline — not yet run
+
+The benchmarks above point at the embedder: dense-only AILA MAP 0.060 against
+BM25's 0.133, and a cited judgment outside the top 30 for 65% of masked
+passages. BGE-base is general-domain and reads 512 tokens.
+
+**Setup shared by every model** (`retrieval/embedding_models.py`):
+- Each model has its own tables (`judgment_embeddings_<key>`,
+  `statute_embeddings_<key>`) keyed on the same `chunk_id` / `section_id`, so
+  models are compared on identical chunks. The BGE tables are never written.
+- `RAG_EMBEDDING_MODEL=<key>` picks the model retrieval, chat and the evals
+  read (default `bge`). Reports and MLflow runs record it.
+- `ingestion/backfill_embeddings.py --model <key>` fills a model's tables
+  from the stored chunk text: resumable, `--limit N` for a throughput sample,
+  HNSW index built once complete. Each table's comment records the weights
+  that filled it.
+- `benchmark/check_embedding_model.py --embedding-model <key>` shows the
+  prompts, pooling and widths actually used, runs a small legal sanity check
+  and measures throughput, before any long run.
+- `aila_benchmark.py pool --embedding-model <key>` scores a model on the AILA
+  pool without touching the database, at any width (full-width vectors are
+  cached once and cut in memory).
+- Non-baseline models skip the 0.2 dense cut-off (tuned on BGE's similarity
+  scale) and keep the top k.
+
+**Euler-Legal-Embedding-V1** (`Mira190/Euler-Legal-Embedding-V1`): a LoRA
+legal fine-tune of Qwen3-Embedding-8B, 4,096 dims, 1,536 tokens, last-token
+pooling. Used as is (no training here). Keys:
+
+| key | model | role |
+|---|---|---|
+| `euler` | Euler-Legal-Embedding-V1 | the experiment |
+| `qwen3_8b` | Qwen/Qwen3-Embedding-8B | control: what the legal fine-tune adds |
+| `qwen3_06b` | Qwen/Qwen3-Embedding-0.6B (1,024 dims) | light option for production |
+
+- pgvector's HNSW indexes at most 4,000 dims (`halfvec`), so the 8B models
+  are stored Matryoshka-truncated to `EULER_DIM` (default 2,048, `halfvec`);
+  tables are named by width (`judgment_embeddings_euler_2048`). Whether
+  Euler keeps its quality when truncated is unverified: compare 4,096 /
+  2,048 / 1,024 on the AILA pool first.
+- Query prompt: the model's own (from its sentence-transformers config)
+  unless `QWEN_QUERY_INSTRUCT` sets a task, giving Qwen3's
+  `Instruct: <task>\nQuery:` format. Documents get none.
+- Unverified third-party upload: review the repo, then pin `EULER_REVISION`
+  to a commit; `trust_remote_code` stays off unless
+  `EULER_TRUST_REMOTE_CODE=1`.
+- Cost: about 16 GB of bf16 weights, so loading it for chat sits next to
+  Qwen-7B on the A6000, and every query goes through an 8B model.
+  Record latency and table size beside quality.
+- Our chunks were cut for BGE (~500 words), so the longer window mainly
+  helps long queries such as AILA's fact situations.
