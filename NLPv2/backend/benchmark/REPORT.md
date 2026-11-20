@@ -805,6 +805,9 @@ passages. BGE-base is general-domain and reads 512 tokens.
   from the stored chunk text: resumable, `--limit N` for a throughput sample,
   HNSW index built once complete. Each table's comment records the weights
   that filled it; a retrained checkpoint can't be mixed in.
+- `benchmark/check_embedding_model.py --embedding-model <key>` shows the
+  prompts, pooling and widths actually used, runs a small legal sanity check
+  and measures throughput, before any long run.
 - `aila_benchmark.py pool --embedding-model <key>` scores a model on the AILA
   pool without touching the database: the cheap first look.
 - Non-baseline models skip the 0.2 dense cut-off (tuned on BGE's similarity
