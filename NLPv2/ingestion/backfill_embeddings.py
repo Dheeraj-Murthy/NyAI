@@ -188,6 +188,10 @@ def main() -> None:
     spec = embedding_models.get_spec(args.model)
     if spec.is_baseline:
         raise SystemExit("Refusing to backfill the baseline: its tables are written by ingest.py only.")
+    try:
+        spec.check_indexable()
+    except ValueError as e:
+        raise SystemExit(str(e))
     targets = ["judgments", "statutes"] if args.target == "all" else [args.target]
 
     conn = connect()

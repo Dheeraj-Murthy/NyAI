@@ -67,14 +67,21 @@ def test_registry():
     finally:
         if old is not None:
             os.environ[em.ENV_VAR] = old
-    for bad in (dict(dim=2048), dict(vector_type="halfvec", dim=4096), dict(judgment_table="x; drop table y"),
-                dict(vector_type="bit")):
+    for bad in (dict(judgment_table="x; drop table y"), dict(vector_type="bit"), dict(dim=0)):
         try:
             _spec(**bad)
         except ValueError:
             pass
         else:
             raise AssertionError(f"bad spec accepted: {bad}")
+    _spec(dim=1536, vector_type="halfvec").check_indexable()
+    for too_wide in (dict(dim=2048), dict(vector_type="halfvec", dim=4096)):
+        try:
+            _spec(**too_wide).check_indexable()  # constructible (AILA pool), not storable
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unindexable width accepted: {too_wide}")
     assert _spec(vector_type="halfvec", dim=2048).cosine_ops == "halfvec_cosine_ops"
     assert _spec().threshold(0.2) == 0.2 and _spec(dense_threshold=-1.0).threshold(0.2) == -1.0
     print("✓ registry passed")

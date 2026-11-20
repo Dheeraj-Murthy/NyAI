@@ -50,9 +50,15 @@ class EmbeddingSpec:
                 raise ValueError(f"bad table name {name!r}")
         if self.vector_type not in ("vector", "halfvec"):
             raise ValueError(f"vector_type must be vector or halfvec, got {self.vector_type!r}")
-        index_limit = 2000 if self.vector_type == "vector" else 4000
-        if self.dim > index_limit:
-            raise ValueError(f"{self.key}: {self.dim} dims exceeds pgvector's HNSW limit for {self.vector_type}")
+        if self.dim < 1:
+            raise ValueError(f"{self.key}: dim must be positive")
+
+    def check_indexable(self) -> None:
+        """pgvector's HNSW index takes up to 2,000 dims as vector, 4,000 as
+        halfvec. Checked when storing, not here: the AILA pool can score any width."""
+        limit = 2000 if self.vector_type == "vector" else 4000
+        if self.dim > limit:
+            raise ValueError(f"{self.key}: {self.dim} dims exceeds pgvector's HNSW limit for {self.vector_type} ({limit})")
 
     @property
     def is_baseline(self) -> bool:
