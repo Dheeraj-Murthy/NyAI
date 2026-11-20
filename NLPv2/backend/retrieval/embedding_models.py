@@ -191,16 +191,21 @@ def encode(model, spec: EmbeddingSpec, texts: Sequence[str], kind: str,
 
 def model_fingerprint(spec: EmbeddingSpec) -> str:
     """Identifies the exact weights a table was filled with. A local directory
-    (a fine-tuned checkpoint) is fingerprinted by its files' names, sizes and
-    mtimes, so retraining into the same path is noticed."""
+    (a fine-tuned checkpoint) is fingerprinted by its files' names and
+    contents, so retraining into the same path is noticed while a copy or a
+    `dvc pull` of the same weights is not (seconds for a BERT-size model)."""
     import hashlib
 
     if os.path.isdir(spec.model_id):
         h = hashlib.sha256()
-        for root, _, files in sorted(os.walk(spec.model_id)):
+        for root, dirs, files in os.walk(spec.model_id):
+            dirs.sort()
             for name in sorted(files):
-                st = os.stat(os.path.join(root, name))
-                h.update(f"{os.path.relpath(os.path.join(root, name), spec.model_id)}:{st.st_size}:{int(st.st_mtime)}\n".encode())
+                path = os.path.join(root, name)
+                h.update(os.path.relpath(path, spec.model_id).encode() + b"\0")
+                with open(path, "rb") as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        h.update(block)
         return f"dir:{h.hexdigest()[:16]}"
     return f"hf:{spec.model_id}@{spec.revision or 'main'}"
 
