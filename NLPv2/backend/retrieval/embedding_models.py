@@ -125,20 +125,32 @@ def prompt_for(model, spec: EmbeddingSpec, kind: str) -> str:
     return p
 
 
-def encode(model, spec: EmbeddingSpec, texts: Sequence[str], kind: str,
-           batch_size: int = 32, show_progress_bar: bool = False):
-    """Unit-length float32 vectors of spec.dim (cut, then re-normalised, when
-    the model outputs more dimensions — Matryoshka truncation)."""
+def encode_full(model, spec: EmbeddingSpec, texts: Sequence[str], kind: str,
+                batch_size: int = 32, show_progress_bar: bool = False):
+    """The model's raw float32 output at its full width (prompt applied)."""
     import numpy as np
 
     prefix = prompt_for(model, spec, kind)
-    emb = model.encode(
+    return model.encode(
         [prefix + (t or "") for t in texts], batch_size=batch_size, convert_to_numpy=True,
         normalize_embeddings=False, show_progress_bar=show_progress_bar,
     ).astype(np.float32)
-    emb = emb[:, : spec.dim]
+
+
+def truncate(emb, dim: int):
+    """First dim dimensions, re-normalised to unit length (Matryoshka truncation)."""
+    import numpy as np
+
+    emb = emb[:, :dim]
     norms = np.linalg.norm(emb, axis=1, keepdims=True)
     return emb / np.where(norms == 0, 1.0, norms)
+
+
+def encode(model, spec: EmbeddingSpec, texts: Sequence[str], kind: str,
+           batch_size: int = 32, show_progress_bar: bool = False):
+    """Unit-length float32 vectors of spec.dim (cut, then re-normalised, when
+    the model outputs more dimensions)."""
+    return truncate(encode_full(model, spec, texts, kind, batch_size, show_progress_bar), spec.dim)
 
 
 def model_fingerprint(spec: EmbeddingSpec) -> str:

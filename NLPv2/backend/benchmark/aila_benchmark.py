@@ -244,8 +244,9 @@ def chunk_words(text: str, size: int = CHUNK_WORDS) -> List[str]:
 class DensePool:
     """Embeddings of every 500-word chunk by one of retrieval's embedding
     models (embedding_models.py; default the BGE baseline); a document scores
-    as its best chunk. Embeddings are cached under the work dir, keyed by
-    task + model + stored dimension."""
+    as its best chunk. Embeddings are cached under the work dir at the
+    model's full width, keyed by task + model, and cut to the spec's
+    dimension in memory, so trying several dimensions embeds the pool once."""
 
     def __init__(self, docs: Dict[str, str], task: str, work_dir: str, embedding_model: Optional[str] = None,
                  batch_size: int = 32):
@@ -262,17 +263,24 @@ class DensePool:
         os.makedirs(work_dir, exist_ok=True)
         tag = hashlib.sha256("\n".join(f"{d}:{len(c)}" for d, c in self.chunks).encode()).hexdigest()[:12]
         # The baseline keeps its old cache name, so existing BGE caches are reused.
-        name = self.spec.model_id if self.spec.is_baseline else f"{self.spec.key}_{self.spec.model_id}_{self.spec.dim}"
+        # Others are keyed by model and prompt, not dimension (cut below).
+        if self.spec.is_baseline:
+            name = self.spec.model_id
+        else:
+            doc_prompt = embedding_models.prompt_for(self.model, self.spec, "document")
+            ptag = hashlib.sha256(doc_prompt.encode()).hexdigest()[:6]
+            name = f"{self.spec.key}_{self.spec.model_id}_full_p{ptag}"
         cache = os.path.join(work_dir, f"emb_{task}_{name.strip('/').replace('/', '_')}_{tag}.npy")
         if os.path.exists(cache):
-            self.emb = np.load(cache)
+            full = np.load(cache)
         else:
             print(f"Embedding {len(self.chunks)} chunks (cached to {cache}) ...")
-            self.emb = embedding_models.encode(
+            full = embedding_models.encode_full(
                 self.model, self.spec, [c for _, c in self.chunks], "document",
                 batch_size=batch_size, show_progress_bar=True,
             )
-            np.save(cache, self.emb)
+            np.save(cache, full)
+        self.emb = embedding_models.truncate(full, self.spec.dim)
 
     def scores(self, query: str) -> Tuple[Dict[str, float], Dict[str, str]]:
         """Best-chunk cosine per document, and that best chunk's text."""
