@@ -334,6 +334,8 @@ def run_eval(
             "graph_boost": graph_boost,
             "bm25_mode": bm25_mode,
             "case_lookup": case_lookup,
+            "embedding_model": retriever.embedding_spec.key,
+            "embedding_model_id": retriever.embedding_spec.model_id,
             "bm25_stats": dict(retriever.bm25_stats),
             "k_values": k_values,
             "crowd_threshold": crowd_threshold,
@@ -490,6 +492,8 @@ def main() -> None:
     tracking.log_benchmark_run(
         script="retrieval_eval",
         params={
+            "embedding_model": report["config"]["embedding_model"],
+            "embedding_model_id": report["config"]["embedding_model_id"],
             "candidate_k": args.candidate_k,
             "threshold": args.threshold,
             "top_k": args.top_k,

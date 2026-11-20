@@ -72,7 +72,6 @@ PUBLISHED_BEST_MAP = {"cases": 0.1492, "statutes": 0.1566}
 CHUNK_WORDS = 500  # ingestion's size-based chunker
 RRF_K = 60
 RERANK_TOP = 30
-EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
@@ -243,32 +242,41 @@ def chunk_words(text: str, size: int = CHUNK_WORDS) -> List[str]:
 
 
 class DensePool:
-    """BGE embeddings of every 500-word chunk; a document scores as its best
-    chunk. Embeddings are cached under the work dir, keyed by task + model."""
+    """Embeddings of every 500-word chunk by one of retrieval's embedding
+    models (embedding_models.py; default the BGE baseline); a document scores
+    as its best chunk. Embeddings are cached under the work dir, keyed by
+    task + model + stored dimension."""
 
-    def __init__(self, docs: Dict[str, str], task: str, work_dir: str, model_name: str = EMBED_MODEL):
+    def __init__(self, docs: Dict[str, str], task: str, work_dir: str, embedding_model: Optional[str] = None,
+                 batch_size: int = 32):
         import numpy as np
-        from sentence_transformers import SentenceTransformer
+        from retrieval import embedding_models
 
         self.np = np
-        self.model = SentenceTransformer(model_name)
+        self.em = embedding_models
+        self.spec = embedding_models.get_spec(embedding_model)
+        self.model = embedding_models.load_model(self.spec)
+        print(f"Embedding model {self.spec.key} ({self.spec.model_id}, {self.spec.dim} dims); "
+              f"query prompt {embedding_models.prompt_for(self.model, self.spec, 'query')!r}")
         self.chunks: List[Tuple[str, str]] = [(d, c) for d, text in docs.items() for c in chunk_words(text)]
         os.makedirs(work_dir, exist_ok=True)
         tag = hashlib.sha256("\n".join(f"{d}:{len(c)}" for d, c in self.chunks).encode()).hexdigest()[:12]
-        cache = os.path.join(work_dir, f"emb_{task}_{model_name.replace('/', '_')}_{tag}.npy")
+        # The baseline keeps its old cache name, so existing BGE caches are reused.
+        name = self.spec.model_id if self.spec.is_baseline else f"{self.spec.key}_{self.spec.model_id}_{self.spec.dim}"
+        cache = os.path.join(work_dir, f"emb_{task}_{name.strip('/').replace('/', '_')}_{tag}.npy")
         if os.path.exists(cache):
             self.emb = np.load(cache)
         else:
             print(f"Embedding {len(self.chunks)} chunks (cached to {cache}) ...")
-            self.emb = self.model.encode(
-                [c for _, c in self.chunks], batch_size=32, convert_to_numpy=True,
-                normalize_embeddings=True, show_progress_bar=True,
+            self.emb = embedding_models.encode(
+                self.model, self.spec, [c for _, c in self.chunks], "document",
+                batch_size=batch_size, show_progress_bar=True,
             )
             np.save(cache, self.emb)
 
     def scores(self, query: str) -> Tuple[Dict[str, float], Dict[str, str]]:
         """Best-chunk cosine per document, and that best chunk's text."""
-        q = self.model.encode(query, convert_to_numpy=True, normalize_embeddings=True)
+        q = self.em.encode(self.model, self.spec, [query], "query")[0]
         sims = self.emb @ q
         best: Dict[str, float] = {}
         best_chunk: Dict[str, str] = {}
@@ -291,7 +299,8 @@ def rrf(rankings: Iterable[List[str]], k: int = RRF_K) -> Dict[str, float]:
 
 
 def run_pool(
-    data_dir: str, task: str, retriever: str, rerank: bool, split: str, work_dir: str
+    data_dir: str, task: str, retriever: str, rerank: bool, split: str, work_dir: str,
+    embedding_model: Optional[str] = None, batch_size: int = 32,
 ) -> Dict[str, Any]:
     if rerank and retriever == "bm25":
         raise SystemExit("--rerank needs a dense or hybrid retriever (it reranks each document's best chunk)")
@@ -299,7 +308,7 @@ def run_pool(
     qids = query_ids(queries, qrels, split)
 
     bm25 = BM25(docs) if retriever in ("bm25", "hybrid") else None
-    dense = DensePool(docs, task, work_dir) if retriever in ("dense", "hybrid") else None
+    dense = DensePool(docs, task, work_dir, embedding_model, batch_size) if retriever in ("dense", "hybrid") else None
     reranker = None
     if rerank:
         from sentence_transformers import CrossEncoder
@@ -333,7 +342,9 @@ def run_pool(
         "config": {
             "task": task, "retriever": retriever, "rerank": rerank, "split": split,
             "n_queries": len(qids), "n_docs": len(docs), "chunk_words": CHUNK_WORDS,
-            "embed_model": EMBED_MODEL if dense else None, "rerank_model": RERANK_MODEL if rerank else None,
+            "embedding_model": dense.spec.key if dense else None,
+            "embed_model": dense.spec.model_id if dense else None,
+            "embed_dim": dense.spec.dim if dense else None, "rerank_model": RERANK_MODEL if rerank else None,
             "elapsed_s": round(time.time() - start, 2),
         },
         "aggregate": mean_metrics(per_query),
@@ -474,6 +485,9 @@ def main() -> None:
     p.add_argument("--rerank", action="store_true", help=f"Cross-encoder over the top {RERANK_TOP}")
     p.add_argument("--split", choices=SPLITS, default="test", help="test = Q11-50, the official evaluation")
     p.add_argument("--work-dir", default=DEFAULT_WORK_DIR)
+    p.add_argument("--embedding-model", default=None,
+                   help="dense model key from retrieval/embedding_models.py (default: RAG_EMBEDDING_MODEL, else bge)")
+    p.add_argument("--batch-size", type=int, default=32, help="embedding batch size (lower it for large models)")
     p.add_argument("--output", default=None)
 
     e = sub.add_parser("export", help="Map onto our corpus and write a judgment_eval gold set (needs DB)")
@@ -489,9 +503,11 @@ def main() -> None:
         export(args.data_dir, args.version, args.output, args.overwrite)
         return
 
-    report = run_pool(args.data_dir, args.task, args.retriever, args.rerank, args.split, args.work_dir)
+    report = run_pool(args.data_dir, args.task, args.retriever, args.rerank, args.split, args.work_dir,
+                      args.embedding_model, args.batch_size)
     cfg = report["config"]
-    run_id = f"{cfg['retriever']}{'_rerank' if cfg['rerank'] else ''}"
+    emb_tag = f"_{cfg['embedding_model']}" if cfg["embedding_model"] not in (None, "bge") else ""
+    run_id = f"{cfg['retriever']}{emb_tag}{'_rerank' if cfg['rerank'] else ''}"
     out = args.output or os.path.join(
         _benchmark_dir, "reports", f"aila_{cfg['task']}_{run_id}_{cfg['split']}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     )
@@ -505,6 +521,15 @@ def main() -> None:
     if cfg["split"] == "test":
         print(f"  (best published MAP, 2019: {report['published_best_map_test']})")
     print(f"Report: {out}\nTREC run: {out[:-5]}.trec")
+
+    import tracking
+
+    tracking.log_benchmark_run(
+        script=f"aila_pool_{cfg['task']}",
+        params={k: cfg[k] for k in ("retriever", "rerank", "split", "n_queries", "embedding_model", "embed_model",
+                                    "embed_dim", "rerank_model")},
+        metrics={k.replace("@", "_at_"): v for k, v in report["aggregate"].items()},
+    )
 
 
 if __name__ == "__main__":

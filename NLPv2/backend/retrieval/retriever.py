@@ -4,8 +4,8 @@ import psycopg2
 import json
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
-from sentence_transformers import SentenceTransformer
 
+from retrieval import embedding_models
 from graph.citation_resolver import (
     STOPWORDS as _NAME_STOPWORDS,
     citation_titles,
@@ -179,6 +179,8 @@ def lookup_strings(query: str) -> List[str]:
 class LegalRetriever:
     bm25_mode = "and_or"
     case_lookup = True
+    # Instances built with __new__ (tests) read the baseline.
+    embedding_spec = embedding_models.get_spec(embedding_models.BASELINE)
     _chunk_doc_freq: Optional[Dict[str, float]] = None
 
     def __init__(
@@ -187,11 +189,15 @@ class LegalRetriever:
         graph_manager: Optional[Any] = None,
         bm25_mode: str = "and_or",
         case_lookup: bool = True,
+        embedding_model: Optional[str] = None,
     ):
         if bm25_mode not in BM25_MODES:
             raise ValueError(f"bm25_mode must be one of {BM25_MODES}, got {bm25_mode!r}")
         self.db_connection_string = db_connection_string or _default_db_connection_string()
         self.embedding_model = None
+        # Which embedding model and pgvector tables the dense legs use
+        # (RAG_EMBEDDING_MODEL, default the BGE baseline): see embedding_models.py.
+        self.embedding_spec = embedding_models.get_spec(embedding_model)
         self.graph_manager = graph_manager
         self.bm25_mode = bm25_mode
         # Needs graph_manager (the citation resolver); off without one.
@@ -210,21 +216,34 @@ class LegalRetriever:
         return self._max_centrality
 
     def _load_embedding_model(self):
+        spec = self.embedding_spec
         try:
-            self.embedding_model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-            print("✓ BGE-base model loaded for retrieval")
+            self.embedding_model = embedding_models.load_model(spec)
+            print(f"✓ Embedding model loaded for retrieval: {spec.key} ({spec.model_id}, "
+                  f"{spec.dim}-dim {spec.vector_type}, tables {spec.judgment_table} / {spec.statute_table})")
         except Exception as e:
-            raise RuntimeError(f"Failed to load embedding model: {e}")
+            raise RuntimeError(f"Failed to load embedding model {spec.key!r}: {e}")
 
-    def get_query_embedding(self, query: str) -> List[float]:
+    def get_query_embedding(self, query: str) -> str:
+        """The query vector in pgvector's text form, for %s::vector / ::halfvec."""
         if not self.embedding_model:
             raise RuntimeError("Embedding model not loaded")
 
         try:
-            embedding = self.embedding_model.encode(query, convert_to_numpy=True)
-            return embedding.tolist()
+            emb = embedding_models.encode(self.embedding_model, self.embedding_spec, [query], "query")[0]
+            return embedding_models.vector_literal(emb)
         except Exception as e:
             raise RuntimeError(f"Failed to generate query embedding: {e}")
+
+    def _dense_sql(self, sql: str) -> str:
+        """Point a dense query at the active model's tables and vector type.
+        Table names come from the registry (validated identifiers), never input."""
+        spec = self.embedding_spec
+        return (
+            sql.replace("judgment_embeddings", spec.judgment_table)
+            .replace("statute_embeddings", spec.statute_table)
+            .replace("::vector", f"::{spec.vector_type}")
+        )
 
     def retrieve_relevant_chunks(
         self, query: str, top_k: int = 8, similarity_threshold: float = 0.3
@@ -236,7 +255,7 @@ class LegalRetriever:
 
         try:
             cur.execute(
-                """
+                self._dense_sql("""
                 SELECT 
                     jc.content,
                     j.petitioner,
@@ -252,11 +271,11 @@ class LegalRetriever:
                 WHERE 1 - (je.embedding <=> %s::vector) >= %s
                 ORDER BY je.embedding <=> %s::vector
                 LIMIT %s
-            """,
+            """),
                 (
                     query_embedding,
                     query_embedding,
-                    similarity_threshold,
+                    self.embedding_spec.threshold(similarity_threshold),
                     query_embedding,
                     top_k,
                 ),
@@ -314,7 +333,7 @@ class LegalRetriever:
 
         try:
             cur.execute(
-                """
+                self._dense_sql("""
                 SELECT
                     jc.content,
                     j.petitioner,
@@ -331,11 +350,11 @@ class LegalRetriever:
                 WHERE 1 - (je.embedding <=> %s::vector) >= %s
                 ORDER BY je.embedding <=> %s::vector
                 LIMIT %s
-            """,
+            """),
                 (
                     query_embedding,
                     query_embedding,
-                    similarity_threshold,
+                    self.embedding_spec.threshold(similarity_threshold),
                     query_embedding,
                     candidate_k,
                 ),
@@ -454,7 +473,7 @@ class LegalRetriever:
 
             # Dense leg
             cur.execute(
-                """
+                self._dense_sql("""
                 SELECT se.section_id, ss.statute_id, st.title, st.short_title,
                        ss.section_number, ss.heading, ss.content,
                        1 - (se.embedding <=> %s::vector) as similarity
@@ -464,8 +483,8 @@ class LegalRetriever:
                 WHERE 1 - (se.embedding <=> %s::vector) >= %s
                 ORDER BY se.embedding <=> %s::vector
                 LIMIT %s
-                """,
-                (query_embedding, query_embedding, similarity_threshold, query_embedding, candidate_k),
+                """),
+                (query_embedding, query_embedding, self.embedding_spec.threshold(similarity_threshold), query_embedding, candidate_k),
             )
             dense = cur.fetchall()
 
@@ -780,7 +799,7 @@ class LegalRetriever:
         cur = conn.cursor()
         try:
             cur.execute(
-                """
+                self._dense_sql("""
                 SELECT DISTINCT ON (jc.judgment_id)
                     jc.content, j.petitioner, j.respondent, j.court,
                     EXTRACT(YEAR FROM j.date_of_judgment), jc.section, jc.chunk_id, jc.judgment_id,
@@ -790,7 +809,7 @@ class LegalRetriever:
                 JOIN judgments j ON j.id = jc.judgment_id
                 WHERE jc.judgment_id = ANY(%s)
                 ORDER BY jc.judgment_id, je.embedding <=> %s::vector
-                """,
+                """),
                 (emb, list(how), emb),
             )
             rows = {r[7]: r for r in cur.fetchall()}
@@ -923,21 +942,21 @@ class LegalRetriever:
 
         try:
             cur.execute(
-                """
+                self._dense_sql("""
                 SELECT 
                     COUNT(*) as total_chunks,
                     AVG(1 - (embedding <=> %s::vector)) as avg_similarity,
                     MAX(1 - (embedding <=> %s::vector)) as max_similarity,
                     MIN(1 - (embedding <=> %s::vector)) as min_similarity
                 FROM judgment_embeddings
-            """,
+            """),
                 (query_embedding, query_embedding, query_embedding),
             )
 
             stats = cur.fetchone()
 
             cur.execute(
-                """
+                self._dense_sql("""
                 SELECT 
                     jc.section,
                     COUNT(*) as count,
@@ -946,7 +965,7 @@ class LegalRetriever:
                 JOIN judgment_chunks jc ON jc.chunk_id = je.chunk_id
                 GROUP BY jc.section
                 ORDER BY avg_similarity DESC
-            """,
+            """),
                 (query_embedding,),
             )
 
