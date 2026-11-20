@@ -156,7 +156,7 @@ def backfill(conn, model, spec, target: str, batch_size: int, limit: int) -> dic
     return {"table": table, "embedded": done, "seconds": seconds, "remaining": remaining}
 
 
-def build_index(conn, spec, table: str) -> None:
+def build_index(conn, spec, table: str, maintenance_work_mem: str) -> None:
     name = f"{table}_hnsw_idx"
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s) IS NOT NULL", (name,))
@@ -165,7 +165,9 @@ def build_index(conn, spec, table: str) -> None:
     print(f"Building HNSW index {name} (can take a while) ...")
     started = time.time()
     with conn.cursor() as cur:
-        cur.execute("SET maintenance_work_mem = '2GB'")
+        # The graph should fit in memory or the build slows sharply (pgvector
+        # prints a notice when it doesn't).
+        cur.execute("SELECT set_config('maintenance_work_mem', %s, false)", (maintenance_work_mem,))
         cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} USING hnsw (embedding {spec.cosine_ops})")
     conn.commit()
     print(f"  done in {time.time() - started:.0f} s")
@@ -179,6 +181,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="embed at most N rows per target (throughput sample)")
     parser.add_argument("--device", default=None, help="e.g. cuda, cuda:0, cpu (default: sentence-transformers' choice)")
     parser.add_argument("--no-index", action="store_true", help="skip building the HNSW index at the end")
+    parser.add_argument("--maintenance-work-mem", default="2GB",
+                        help="Postgres memory for the HNSW build (raise for large/wide tables, e.g. 8GB)")
     args = parser.parse_args()
 
     spec = embedding_models.get_spec(args.model)
@@ -208,7 +212,7 @@ def main() -> None:
                 f"{target}_rows_per_s": rate, f"{target}_remaining": res["remaining"],
             })
             if res["remaining"] == 0 and not args.no_index:
-                build_index(conn, spec, res["table"])
+                build_index(conn, spec, res["table"], args.maintenance_work_mem)
         tracking.log_ingestion_run(
             "backfill_embeddings.py",
             {"embedding_model": spec.key, "model_id": spec.model_id, "revision": spec.revision,
