@@ -74,11 +74,21 @@ def ensure_table(cur, spec, target: str) -> str:
         (table,),
     )
     row = cur.fetchone()
+    # The table's comment records which weights filled it, so a retrained
+    # checkpoint never adds vectors to a table made by an older one.
+    stamp = f"{spec.key} {spec.model_id} {embedding_models.model_fingerprint(spec)}"
     if row:
         if row[0] != want:
             raise SystemExit(
                 f"{table} exists with embedding {row[0]}, spec wants {want}. Not touching it: "
                 "use a different table name in embedding_models.py, or drop it yourself if it's disposable."
+            )
+        cur.execute("SELECT obj_description(to_regclass(%s), 'pg_class')", (table,))
+        existing = cur.fetchone()[0]
+        if existing and existing != stamp:
+            raise SystemExit(
+                f"{table} was filled by\n  {existing}\nbut the model now is\n  {stamp}\n"
+                f"Mixing them would corrupt the comparison. If the old vectors are disposable: DROP TABLE {table};"
             )
         return table
     cur.execute(
@@ -87,6 +97,7 @@ def ensure_table(cur, spec, target: str) -> str:
         f" embedding {want} NOT NULL,"
         f" created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
     )
+    cur.execute(f"COMMENT ON TABLE {table} IS %s", (stamp,))
     return table
 
 

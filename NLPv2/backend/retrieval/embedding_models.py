@@ -141,6 +141,22 @@ def encode(model, spec: EmbeddingSpec, texts: Sequence[str], kind: str,
     return emb / np.where(norms == 0, 1.0, norms)
 
 
+def model_fingerprint(spec: EmbeddingSpec) -> str:
+    """Identifies the exact weights a table was filled with. A local directory
+    (a fine-tuned checkpoint) is fingerprinted by its files' names, sizes and
+    mtimes, so retraining into the same path is noticed."""
+    import hashlib
+
+    if os.path.isdir(spec.model_id):
+        h = hashlib.sha256()
+        for root, _, files in sorted(os.walk(spec.model_id)):
+            for name in sorted(files):
+                st = os.stat(os.path.join(root, name))
+                h.update(f"{os.path.relpath(os.path.join(root, name), spec.model_id)}:{st.st_size}:{int(st.st_mtime)}\n".encode())
+        return f"dir:{h.hexdigest()[:16]}"
+    return f"hf:{spec.model_id}@{spec.revision or 'main'}"
+
+
 def vector_literal(values: Sequence[float]) -> str:
     """pgvector text form, accepted by both ::vector and ::halfvec."""
     return "[" + ",".join(repr(float(v)) for v in values) + "]"
