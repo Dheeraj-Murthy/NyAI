@@ -1,0 +1,4 @@
+# training/ only (citation_pairs.py, train_embedder.py), on top of backend/requirements.txt
+sentence-transformers>=3.0
+datasets>=2.19
+accelerate>=0.26

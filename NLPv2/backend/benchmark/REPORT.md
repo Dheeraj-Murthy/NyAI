@@ -788,3 +788,52 @@ appellant/respondent/petitioner(s) at the end of a party,
 Against the start of #12 (AND, no lookup): case lookup 0.397 → 0.994,
 `query_short` 0.070 → 0.088, passage and AILA unchanged, synthetic
 0.625 → 0.650.
+
+## Update (2026-11-20): other embedding models, alongside the BGE baseline — not yet run
+
+The benchmarks above point at the embedder: dense-only AILA MAP 0.060 against
+BM25's 0.133, and a cited judgment outside the top 30 for 65% of masked
+passages. BGE-base is general-domain and reads 512 tokens.
+
+**Setup shared by every model** (`retrieval/embedding_models.py`):
+- Each model has its own tables (`judgment_embeddings_<key>`,
+  `statute_embeddings_<key>`) keyed on the same `chunk_id` / `section_id`, so
+  models are compared on identical chunks. The BGE tables are never written.
+- `RAG_EMBEDDING_MODEL=<key>` picks the model retrieval, chat and the evals
+  read (default `bge`). Reports and MLflow runs record it.
+- `ingestion/backfill_embeddings.py --model <key>` fills a model's tables
+  from the stored chunk text: resumable, `--limit N` for a throughput sample,
+  HNSW index built once complete. Each table's comment records the weights
+  that filled it; a retrained checkpoint can't be mixed in.
+- `aila_benchmark.py pool --embedding-model <key>` scores a model on the AILA
+  pool without touching the database: the cheap first look.
+- Non-baseline models skip the 0.2 dense cut-off (tuned on BGE's similarity
+  scale) and keep the top k.
+
+**InLegalBERT** (`law-ai/InLegalBERT`: LEGAL-BERT further pre-trained on
+Indian SC/HC judgments; 768-dim, 512 tokens). It is a masked-language model,
+not an embedder, so three keys:
+
+| key | model | role |
+|---|---|---|
+| `inlegal` | InLegalBERT, mean-pooled, no training | zero-shot reference |
+| `inlegal_ft` | InLegalBERT fine-tuned on citation pairs (`models/inlegal-ft`) | the experiment |
+| `bge_ft` | BGE-base fine-tuned on the same pairs (`models/bge-ft`) | control: legal pre-training vs. fine-tuning |
+
+Training data (`training/citation_pairs.py`): the masked-citation
+construction applied to all eligible edges: passage of A around a citation
+(masked) → the chunk of cited B sharing most content words with it; 30% of
+queries use the 40-word window; landmark targets capped at 20 pairs;
+optional BGE-mined hard negatives from ranks 10–50, skipping relevant
+judgments. Every judgment referenced by the gold sets passed with
+`--holdout` is excluded on both sides of an edge, and 2% of citing
+judgments go to a dev split.
+
+Training (`training/train_embedder.py`): sentence-transformers,
+`CachedMultipleNegativesRankingLoss` (batch 128, in-batch + hard negatives),
+no duplicate texts in a batch, bf16, 1 epoch, lr 2e-5; dev retrieval
+metrics and losses to MLflow (`legal-rag-training`).
+
+Caveat for the write-up: InLegalBERT's pre-training corpus (SC/HC judgments)
+likely overlaps our corpus and AILA's documents. That is text it has read,
+not the citation labels it is tested on.

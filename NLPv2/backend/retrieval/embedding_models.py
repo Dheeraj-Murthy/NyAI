@@ -21,6 +21,8 @@ from typing import Dict, List, Optional, Sequence
 
 ENV_VAR = "RAG_EMBEDDING_MODEL"
 BASELINE = "bge"
+# <repo>/models/: fine-tuned checkpoints (dvc add them; they are not in git).
+MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "models")
 _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
@@ -75,6 +77,40 @@ def _registry() -> Dict[str, EmbeddingSpec]:
             dim=768,
             judgment_table="judgment_embeddings",
             statute_table="statute_embeddings",
+        ),
+        # InLegalBERT (law-ai, ICAIL 2023): LEGAL-BERT further pre-trained on
+        # Indian SC/HC judgments. A masked-language model, not trained to
+        # embed: used as is it is mean-pooled (sentence-transformers' default
+        # for a plain encoder) — the zero-shot reference point.
+        EmbeddingSpec(
+            key="inlegal",
+            model_id="law-ai/InLegalBERT",
+            dim=768,
+            judgment_table="judgment_embeddings_inlegal",
+            statute_table="statute_embeddings_inlegal",
+            max_seq_length=512,
+            dense_threshold=-1.0,  # its cosine scale isn't BGE's; keep the top k
+        ),
+        # InLegalBERT fine-tuned on citation pairs (training/train_embedder.py).
+        EmbeddingSpec(
+            key="inlegal_ft",
+            model_id=os.environ.get("INLEGAL_FT_PATH", os.path.join(MODELS_DIR, "inlegal-ft")),
+            dim=768,
+            judgment_table="judgment_embeddings_inlegal_ft",
+            statute_table="statute_embeddings_inlegal_ft",
+            max_seq_length=512,
+            dense_threshold=-1.0,
+        ),
+        # Control: BGE fine-tuned on the same pairs. Separates "Indian legal
+        # pre-training helps" from "fine-tuning on our citations helps".
+        EmbeddingSpec(
+            key="bge_ft",
+            model_id=os.environ.get("BGE_FT_PATH", os.path.join(MODELS_DIR, "bge-ft")),
+            dim=768,
+            judgment_table="judgment_embeddings_bge_ft",
+            statute_table="statute_embeddings_bge_ft",
+            max_seq_length=512,
+            dense_threshold=-1.0,
         ),
     ]
     return {s.key: s for s in specs}

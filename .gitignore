@@ -201,3 +201,9 @@ NLPv2/ingestion/outputs/
 # =========================
 *.pdf
 RAG_Technical_Guide.md
+
+# Fine-tuned embedding models and their checkpoints (backend/training/):
+# versioned with DVC (`dvc add models/<name>`), only the .dvc pointers in git.
+/models/**
+!/models/**/
+!/models/**/*.dvc
