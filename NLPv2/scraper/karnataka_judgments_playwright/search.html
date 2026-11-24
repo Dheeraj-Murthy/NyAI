@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Karnataka High Court Judgments - Search</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 20px auto;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #183a52;
+            border-bottom: 3px solid #183a52;
+            padding-bottom: 20px;
+        }
+        .stats {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+        .search-box {
+            width: 100%;
+            padding: 10px;
+            font-size: 16px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-sizing: border-box;
+        }
+        .judgment {
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        .judgment:hover {
+            background-color: #f0f0f0;
+        }
+        .case-number {
+            font-weight: bold;
+            color: #183a52;
+            font-size: 18px;
+        }
+        .date {
+            color: #666;
+            font-size: 14px;
+        }
+        .text-preview {
+            color: #333;
+            font-size: 14px;
+            max-height: 100px;
+            overflow-y: auto;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+            color: white;
+            margin-left: 10px;
+        }
+        .badge-pdf {
+            background-color: #28a745;
+        }
+        .badge-text {
+            background-color: #6c757d;
+        }
+        a {
+            color: #183a52;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <h1>Karnataka High Court Judgments Search</h1>
+
+    <div class="stats">
+        <h3>Statistics</h3>
+        <p><strong>Total Judgments:</strong> 0</p>
+        <p><strong>Bench:</strong> Reportable</p>
+        <p><strong>Last Updated:</strong> 2026-11-01 13:11</p>
+    </div>
+
+    <input type="text" id="search" class="search-box" placeholder="Search by case number, judge, petitioner, respondent, or text content...">
+
+    <div id="results"></div>
+
+    <script>
+        const judgments = [];
+
+        document.getElementById('search').addEventListener('input', function(e) {
+            const searchTerm = e.target.value.toLowerCase();
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '';
+
+            if (searchTerm.length < 2) {
+                resultsDiv.innerHTML = '<p style="text-align:center;color:#666;">Type at least 2 characters to search...</p>';
+                return;
+            }
+
+            const filtered = judgments.filter(j => 
+                j.case_number.toLowerCase().includes(searchTerm) ||
+                j.judges.toLowerCase().includes(searchTerm) ||
+                j.petitioner.toLowerCase().includes(searchTerm) ||
+                j.respondent.toLowerCase().includes(searchTerm) ||
+                (j.text_preview && j.text_preview.toLowerCase().includes(searchTerm))
+            );
+
+            if (filtered.length === 0) {
+                resultsDiv.innerHTML = '<p style="text-align:center;color:#666;">No judgments found matching your search.</p>';
+                return;
+            }
+
+            filtered.forEach(j => {
+                const div = document.createElement('div');
+                div.className = 'judgment';
+                div.innerHTML = `
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <span class="case-number">${j.case_number}</span>
+                        <span class="date">${j.date}</span>
+                    </div>
+                    <div><strong>Judges:</strong> ${j.judges}</div>
+                    <div><strong>Petitioner:</strong> ${j.petitioner}</div>
+                    <div><strong>Respondent:</strong> ${j.respondent}</div>
+                    ${j.text_preview ? '<div class="text-preview">' + j.text_preview.substring(0, 300) + '...</div>' : ''}
+                    <div>
+                        <a href="${j.pdf_path}" target="_blank" style="font-size:12px;">Open PDF</a>
+                        <span class="badge badge-pdf">PDF</span>
+                        ${j.text_path ? '<a href="${j.text_path}" target="_blank">View Text</a>' : '<span class="badge badge-text">No Text</span>'}
+                    </div>
+                `;
+                resultsDiv.appendChild(div);
+            });
+        });
+    </script>
+</body>
+</html>
