@@ -10,7 +10,6 @@ from typing import List, Tuple, Dict, Any, Optional
 import psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 # backend/ is a sibling directory, not a package ingestion/ installs — add it
@@ -23,6 +22,7 @@ from documents import relative_source_path
 
 # Initialize local embedding model
 try:
+    from sentence_transformers import SentenceTransformer
     embedding_model = SentenceTransformer('BAAI/bge-base-en-v1.5')
     MODEL_AVAILABLE = True
     print("Local BGE-base model loaded successfully")

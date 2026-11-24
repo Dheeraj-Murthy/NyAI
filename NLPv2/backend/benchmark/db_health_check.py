@@ -39,9 +39,9 @@ def main():
     ap.add_argument("--json")
     a = ap.parse_args()
     con = psycopg2.connect(a.dsn)
-    con.set_session(readonly=True)
+    con.set_session(readonly=True, autocommit=True)
     cur = con.cursor()
-    cur.execute("set statement_timeout = '300s'")
+    cur.execute("set statement_timeout = '1800s'")
     cols = table_cols(cur)
     J = cols.get("judgments", set())
     if not J:
@@ -102,8 +102,8 @@ def main():
 
     print("\n== text quality (mojibake: non-ASCII ratio) ==")
     r = conn_q(cur, """with s as (select id, length(judgment_text) L,
-            length(regexp_replace(judgment_text, '[\\x01-\\x7f]', '', 'g')) na
-            from judgments where judgment_text is not null)
+            length(regexp_replace(substr(judgment_text,1,20000), '[\\x01-\\x7f]', '', 'g')) na
+            from (select id, substr(judgment_text,1,20000) judgment_text from judgments where judgment_text is not null) q)
             select count(*) filter (where L>0 and na::float/L > 0.20),
                    count(*) filter (where L>0 and na::float/L > 0.05),
                    count(*) filter (where L>0 and na::float/L > 0.01) from s""")

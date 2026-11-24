@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS judgments (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ALTER TABLE judgments ADD COLUMN IF NOT EXISTS source_file TEXT;
+-- eCourts case reference number and disposal outcome (set by ingestion/ingest_aws.py).
+ALTER TABLE judgments ADD COLUMN IF NOT EXISTS cnr TEXT;
+ALTER TABLE judgments ADD COLUMN IF NOT EXISTS disposal_nature TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS judgments_cnr_uidx ON judgments(cnr) WHERE cnr IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS judgment_chunks (
     chunk_id SERIAL PRIMARY KEY,
