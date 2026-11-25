@@ -15,9 +15,10 @@ MARGIN = "ABCDEFGH"
 EM_DASH = chr(8212)
 EN_DASH = chr(8211)
 
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")      # backspaces etc. that pdftotext leaves in 2024+ PDFs
 _RUNNING_HEADER_RES = [
-    re.compile(r"^\s*\[\d{4}\]\s+(\d+\s+|SUPP\.?\s*\d*\s+)?S\.?C\.?R\.?(\s+\d+)?\s*(:\s*\d{4}\s+INSC\s+\d+)?\s*\d*\s*$", re.I),
-    re.compile(r"^\s*(\d{1,4}\s+)?(S\.?C\.?R\.?\s+)?SUPREME COURT REPORTS.*$", re.I),
+    re.compile(r"^\s*(\d{1,4}\s+)?\[\d{4}\]\s+(\d+\s+|SUPP\.?\s*\d*\s+)?S\.?C\.?R\.?(\s+\d+)?\s*(:\s*\d{4}\s+INSC\s+\d+)?\s*\d*\s*$", re.I),
+    re.compile(r"^\s*(\d{1,4}\s+)?(DIGITAL\s+)?(S\.?C\.?R\.?\s+)?SUPREME COURT REPORTS\s*(\[\d{4}\].*)?\s*\d*\s*$", re.I),
     re.compile(r"^\s*\d{1,4}\s*$"),  # lone page number
 ]
 
@@ -34,7 +35,11 @@ def _is_title_header(line: str) -> bool:
     return bool(letters) and (upper / len(letters) > 0.6 or re.search(r"\bv\.?\b|\bvs\.?\b", s, re.I) is not None)
 
 
-def _page_lines(page: str, first_page: bool):
+def _norm(line: str) -> str:
+    return re.sub(r"\d+", "#", _CTRL.sub(" ", line)).strip()
+
+
+def _page_lines(page: str, first_page: bool, drop_norms=frozenset()):
     """(indent, text) for each line of one page, headers and margin letters removed.
     A blank line is None."""
     cur = -1
@@ -42,10 +47,13 @@ def _page_lines(page: str, first_page: bool):
     seen_first = False
     dropped_title = False
     for raw in page.split("\n"):
+        raw = _CTRL.sub(" ", raw)
         if not raw.strip():
             out.append(None)
             continue
         if any(r.match(raw) for r in _RUNNING_HEADER_RES):
+            continue
+        if drop_norms and _norm(raw) in drop_norms:
             continue
         if not seen_first:
             seen_first = True
@@ -82,8 +90,17 @@ def _page_lines(page: str, first_page: bool):
 
 def clean_to_paragraphs(raw: str) -> List[str]:
     seq = []
-    for pi, page in enumerate(raw.split("\f")):
-        seq.extend(_page_lines(page, first_page=(pi == 0)))
+    pages = raw.split("\f")
+    # Lines that repeat on at least half the pages (after masking digits) are
+    # running headers/footers the patterns above didn't know about.
+    counts = {}
+    for page in pages:
+        for ln in set(_norm(l) for l in page.split("\n") if l.strip()):
+            counts[ln] = counts.get(ln, 0) + 1
+    thresh = max(4, len(pages) // 2)
+    drop_norms = frozenset(n for n, c in counts.items() if c >= thresh and 3 <= len(n) <= 90 and n.replace("#", "").strip(" .:-"))
+    for pi, page in enumerate(pages):
+        seq.extend(_page_lines(page, first_page=(pi == 0), drop_norms=drop_norms))
     paras, cur, prev_indent, prev_text = [], [], 0, ""
 
     def flush():
