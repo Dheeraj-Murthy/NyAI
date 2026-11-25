@@ -12,6 +12,7 @@ from graph.citation_resolver import (
     case_name_alias,
     extract_citation_header,
     normalize_case_name,
+    clean_party_name,
     parse_reporter_citations,
 )
 
@@ -68,6 +69,12 @@ def test_name_normalisation():
     print("--- Testing case name normalisation ---")
     assert normalize_case_name("The State of M.P. & Ors. Vs. Ram Kumar") == "state of madhya pradesh v ram kumar"
     assert normalize_case_name("UOI v. M/s. Tata Steel Ltd.") == "union of india v tata steel ltd"
+    # Role labels on newer party lines are dropped, only at the end of a party.
+    assert normalize_case_name("P.EKNATH ...Appellant(s) Vs. Y. Amaranatha Reddy ...Respondent(s)") == "p eknath v y amaranatha reddy"
+    assert normalize_case_name("Hirabai (D) Thr. L.Rs. & Ors. ….Appellant (s)") == "hirabai d thr l rs"
+    assert normalize_case_name("SHRI PRABHAT CHANDRA DAS …Petitioner v. Union of India ...Respondents") == "shri prabhat chandra das v union of india"
+    assert normalize_case_name("Petitioners Association v. State") == "petitioners association v state"
+    assert clean_party_name("M/s Moti Ratan Estate ..Respondents WITH CIVIL APPEAL NO. 6998 OF 2019 (Arising from SLP") == "M/s Moti Ratan Estate ..Respondents"
     assert case_name_alias("THE STATE OF BOMBAY", "BHANJI MUNJI AND ANOTHER.OCTOBER 12, 1954.[MEHR CHAND") == "state of bombay v bhanji munji"
     assert case_name_alias("In re SANT RAM", "RESPONDENT:") is None
     print("✓ normalisation passed")

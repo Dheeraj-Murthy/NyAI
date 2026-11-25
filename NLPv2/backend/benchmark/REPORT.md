@@ -242,3 +242,601 @@ there was effectively no gap left to close.
   benchmarking technique — bigger than either fix made in this update.
 - Corpus corruption re-scan (corrected non-ASCII threshold) is still
   outstanding, unrelated to the above.
+
+---
+
+## Update (2026-11-08): commentary gold set — government sources (in progress, issue #11)
+
+The synthetic gold set writes each question *from the chunk it is scored
+against*, and the 25% word-overlap gate actively requires the question to
+reuse that chunk's wording. It therefore measures paraphrase lookup more
+than legal research, and favours BM25. A second, independent gold set is
+being built from government legal commentary: a commentary states a
+proposition of law and cites the Supreme Court cases behind it, written by
+people who never saw our chunks.
+
+### Scope (deliberately small)
+
+| Source | Status |
+|---|---|
+| Law Commission Report No. 262, *The Death Penalty* (2015) | in manifest, text layer |
+| Law Commission Report No. 268, *Provisions Relating to Bail* (2017) | in manifest, text layer |
+| Law Commission Report No. 277, *Wrongful Prosecution* (2018) | in manifest, scanned → OCR |
+| National / State Judicial Academy compendiums | next, once official PDFs are located |
+| Official SCR / eSCR headnotes | **excluded**: the JUDIS corpus already contains each judgment's `HEADNOTE:` section, so a headnote-derived question would be scored against its own source |
+
+Target: ~100–150 human-reviewed queries before quoting any number.
+
+### Pipeline (`commentary_gold.py`, `judgment_eval.py`)
+
+1. `extract` — pdftotext per page, OCR (pdftoppm + tesseract) for pages
+   with no text layer, cached; keep pages with something citation-like.
+   PDFs are pinned by sha256 in `data/commentary_sources.json`.
+2. `propose` — the LLM (local Qwen by default) reads a page, footnotes
+   included, and returns `{proposition, question, cases}`. Automatic
+   rejections: a cited case not findable in the page text (invented
+   citation); a question that contains a citation, a case title or a cited
+   party's name; no cited case that resolves to a corpus judgment (same
+   `CitationResolver` as the citation graph, with a case-name fallback
+   because commentary cites SCC while JUDIS headers carry AIR/SCR).
+3. `review` — CSV for a law student: accept / reject / rewrite question.
+4. `finalize --version v1` — frozen `data/commentary_gold_v1.json`; never
+   regenerated in place.
+5. `judgment_eval.py` — judgment-level, every cited corpus case counts
+   as relevant: hit@k, recall@k (share of cited cases found), nDCG@k, MRR,
+   ranked over **distinct** judgments, with bootstrap 95% CIs and a
+   per-source breakdown. Validates judgment ids against stored case names
+   so a re-ingest can't silently mis-score.
+
+### How to run
+
+```bash
+cd NLPv2/backend
+python benchmark/commentary_gold.py extract                 # PDFs in <repo>/data/commentary/
+python benchmark/commentary_gold.py propose --max-pages 10  # trial; needs DB + GPU
+python benchmark/commentary_gold.py review                  # -> benchmark/work/commentary/review.csv
+python benchmark/commentary_gold.py finalize --version v1
+python benchmark/judgment_eval.py --gold benchmark/data/commentary_gold_v1.json
+python tests/smoke_test_commentary_gold.py                  # offline checks
+```
+
+## Update (2026-11-08): masked-citation gold set — no human labelling (issue #11)
+
+Built ahead of the commentary set, because it needs no reviewer with a legal
+background: the ground truth is the judges' own citations.
+
+**Method** (`masked_citation_gold.py`): for a resolved `citation_edges` row
+A → B, take the paragraph of A around the citation (≤150 words; plus a
+40-word `query_short` variant), mask every citation, case title, "supra"
+and the identifying name words of each cited case, and ask retrieval to
+find B. Every corpus case cited within that window and masked is also
+relevant.
+
+**Guards**
+- Only `reporter` / `exact_name` resolutions; target not dated after source.
+- Citation must be in the body (after `JUDGMENT:`), never the JUDIS header,
+  whose `CITATOR INFO` lists *later* cases citing A.
+- Passages quoting B (>20% of 8-word shingles found in B) are dropped;
+  otherwise this collapses back into paraphrase lookup.
+- A is excluded from the ranking (`judgment_eval.py` over-fetches 2× and
+  drops it), since A's own chunk contains the passage verbatim.
+- One record per citing judgment, ≤2 per cited judgment; target in-degree
+  recorded, and results are split rarely-cited / 5–49 / 50+ — the bucket
+  where `--graph-boost` should help or hurt.
+
+**Diagnostic worth watching**: the BM25 leg uses `plainto_tsquery`, which
+ANDs every term, so passage-length queries likely match no chunk and
+hybrid retrieval silently becomes dense-only. `judgment_eval.py` reports
+how many queries had zero BM25 hits.
+
+```bash
+cd NLPv2/backend
+python benchmark/masked_citation_gold.py --n 500 --seed 1 --version v1
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --limit 20   # smoke run
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --query-field query_short
+python tests/smoke_test_masked_citation.py
+```
+
+### Results v1 (2026-11-08, n=500, seed 1, candidate_k=30, top_k=8)
+
+| Query | Stage-1 hit@8 | Final hit@8 | Final MRR | Stage-1 hit@30 | BM25 empty |
+|---|---|---|---|---|---|
+| `query` (≤150 words) | 0.238 [0.202, 0.274] | **0.200** [0.166, 0.236] | 0.092 [0.073, 0.113] | 0.346 | 89 (18%) |
+| `query_short` (40 words) | 0.076 [0.054, 0.100] | **0.070** [0.048, 0.092] | 0.038 | 0.126 | 27 (5%) |
+
+95% bootstrap CIs in brackets. Builder: 128,912 eligible edges → 500
+records; 178 have more than one relevant judgment.
+
+**Findings**
+- **First-stage recall is the bottleneck.** The cited judgment is absent
+  from the top 30 candidates for 65% of passage queries. Raising
+  `candidate_k` to 60 moves stage-1 hit@30 only 0.346 → 0.356 and final
+  hit@8 not at all, so the answer is not just below the cut-off.
+- **The reranker hurts on this task.** Paired on the same 500 queries
+  (passage), reranking lost the hit for 37 queries and gained it for 18:
+  McNemar p = 0.014. For `query_short` it is 8 vs 5, p = 0.58 (no effect).
+  MiniLM was trained on MS MARCO question→passage; a judge's argument →
+  precedent is a different relation.
+- **BM25 emptiness is not the main cause.** Final hit@8 is 0.169 when BM25
+  returned nothing vs 0.207 otherwise (passage) — a small gap.
+- **Heavily cited judgments are hardest**: hit@8 0.141 (in-degree 50+,
+  n=78) vs 0.210 (5–49) and 0.215 (<5). Landmark cases are cited for many
+  propositions, so no single passage resembles their text.
+- **Short queries are much harder** — relevant because real user queries
+  are short.
+
+**Caveat.** Other judgments stating the same rule are valid answers but
+unlabelled, so absolute numbers understate quality. Use this set to
+compare configurations (paired), not as a standalone score.
+
+**`--graph-boost` was a no-op in these runs.** `judgment_eval.py` and
+`retrieval_eval.py` built `LegalRetriever()` without a graph manager, so
+the boost was skipped (identical numbers at 0.0 and 0.3). Fixed: the
+evals now pass a `CitationGraphManager` when `--graph-boost > 0`. Note also
+that `judgment_graph_stats.pagerank` is raw PageRank (sums to 1 over the
+corpus: max 0.0053, p99 0.00019, n = 46,453), so `rrf * (1 + boost *
+pagerank)` lifted even the most-cited judgment by 0.16% at boost 0.3.
+Fixed in `retriever.py`: centrality is divided by the corpus maximum, so
+`graph_boost` is the most-cited judgment's lift. Production is unaffected
+by default (`graph_boost` defaults to 0).
+
+Re-run with the rescaled boost (passage queries):
+
+| graph_boost | Stage-1 hit@8 | Stage-1 hit@30 | Final hit@8 | Final hit@8, 50+ cited |
+|---|---|---|---|---|
+| 0 | 0.238 | 0.346 | 0.200 | 0.141 |
+| 0.1 | 0.240 | 0.348 | 0.200 | 0.141 |
+| 0.3 | 0.244 | 0.348 | 0.198 | 0.128 |
+
+No meaningful effect (±1–3 queries of 500). Two reasons: centrality is
+very skewed (p99 is 3.6% of the max), so almost every candidate gets ~no
+lift; and the cross-encoder re-scores from text alone, so the boost can
+only matter by changing which 30 candidates reach it (hit@30 +1 query).
+Graph boost is not a lever for this task in its current form.
+
+**Retriever ablation** (`--retriever`; stage 1 = retriever alone, stage 2 =
++ reranker; passage queries):
+
+| Stage 1 | hit@8 alone | hit@8 + reranker | hit@30 |
+|---|---|---|---|
+| hybrid (production) | 0.238 | 0.200 | 0.346 |
+| dense only | 0.238 | 0.200 | 0.346 |
+| BM25 only | 0.000 | 0.000 | 0.000 |
+
+Hybrid equals dense to three decimals: **the BM25 leg contributes nothing
+for passage-length queries.** `plainto_tsquery` ANDs every term, and a
+masked passage is verbatim from the citing judgment, so the only chunks
+containing all of its words are the citing judgment's own — which the
+eval excludes. The earlier "BM25 empty: 89/500" figure counted before that
+exclusion and hid this; counting usable candidates, BM25 contributes
+nothing for **443/500 (89%)** queries.
+In production the same AND-semantics means BM25 only fires for short
+queries whose every word co-occurs in one chunk. Candidate fix (#12): an
+OR-ed tsquery (`to_tsquery` joined with `|`) ranked by `ts_rank_cd`.
+
+**v1 query audit** (regex counts over the 500 frozen queries):
+- Identity leaks of a relevant case: ~9 (<2%), mostly initials the
+  ≥4-letter name-word rule misses ("A.R. case" → A.R. Antulay). Too few
+  to move the numbers.
+- Noise that does not leak the answer: stray `]` from partly masked
+  citations (110), unmasked reporters of other cases — JT, SCALE, LLJ,
+  Lab IC (≈30), SCR headnote text with pin cites `[227B-D]` / "referred
+  to." lists (≈13–24).
+- A v2 builder should mask whole case titles including initials, cover
+  more reporters, drop headnote-like passages and strip empty brackets.
+  v1 stays frozen; build v2 alongside, never in place.
+
+## Update (2026-11-08): BM25 leg switched to an OR query (issue #12) — not yet measured
+
+The judgment BM25 leg (`retrieve_bm25_candidates`) now defaults to
+`bm25_mode="or"`: the query's stemmed, stopword-free lexemes (Postgres'
+own `english` config, so they match `content_tsv`) are OR-ed into a
+tsquery and ranked by `ts_rank_cd`. To keep it cheap, lexemes that occur in
+more than 5% of chunks are dropped (frequencies come from `pg_stats`
+`most_common_elems`, which ANALYZE already maintains — no new table), and at
+most 32 terms are kept, rarest first. If nothing survives, BM25 returns no
+candidates rather than matching every chunk. `bm25_mode="and"` keeps the old
+`plainto_tsquery` leg for ablations. Statute BM25 is unchanged (AND).
+
+Checked offline (`tests/smoke_test_bm25_or.py`) and against a scratch
+Postgres 16 with the real schema's `content_tsv` column; **not yet run on
+the corpus**. To measure (paired against the AND rows above):
+
+```bash
+cd NLPv2/backend
+for m in and or; do
+  python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --bm25-mode $m
+  python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --bm25-mode $m --query-field query_short
+  python benchmark/retrieval_eval.py --gold benchmark/data/gold_set.json --bm25-mode $m   # synthetic set: regression check
+done
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --retriever bm25
+```
+
+What to look for: hybrid stage-1 hit@30 above dense-only (0.346), the
+BM25-usable count well above 57/500, no drop on the synthetic set (where the
+AND leg was strong), and `bm25_mean_ms` acceptable for chat latency.
+
+## Update (2026-11-08): case-name / citation lookup gold set (issue #11) — not yet run
+
+Users often just name the case they want ("Maneka Gandhi v. Union of
+India", "the Maneka Gandhi case", "AIR 1978 SC 597"). Chat retrieval has no
+lookup path for these: they go through dense + BM25 + reranker like any
+question. `case_lookup_gold.py` builds this set with no labelling — the
+answer is the judgment whose own header names those parties or carries that
+citation.
+
+- Four query variants per sampled judgment, scored as separate groups:
+  `full_name`, `question` ("What was held in X v. Y?"), `party_name`
+  (the rarer distinctive party + "case") and `citation` (from the JUDIS
+  `CITATION:` header or stored reporters, written as "AIR 1978 SC 597" /
+  "(1978) 2 SCR 621").
+- Relevant = every judgment the query names equally well (same normalised
+  case name, same party, same reporter key — connected appeals share one);
+  queries naming more than 5 judgments are dropped as unscoreable.
+- Upper-case JUDIS party names are re-cased as a user would type them.
+- `judgment_eval.py --retriever lookup` scores the Graph page's alias search
+  (`judgment_aliases`: reporter keys + trigram names) on the same set — the
+  ceiling a lookup route in chat could reach. It has no reranker stage.
+
+```bash
+cd NLPv2/backend
+python benchmark/case_lookup_gold.py --n 200 --seed 1 --version v1
+for m in and or; do python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --bm25-mode $m; done
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --retriever dense
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --retriever lookup
+python tests/smoke_test_case_lookup.py
+```
+
+Expectation to test: BM25 should matter most here (exact party names,
+reporter numbers), so this is also the set where the OR-query change can
+help or hurt most; dense is likely weak on bare citations. If `lookup`
+beats chat retrieval by a wide margin, routing name/citation queries in
+chat through the alias table is the obvious fix.
+
+## Update (2026-11-08): FIRE 2019 AILA benchmark (issue #15)
+
+External labels and published runs to compare against: 50 fact situations
+(Q1–10 training, **Q11–50 the official test**), a pool of 2,914 Supreme Court
+judgments and 197 statutes, TREC qrels. CC BY 4.0, Zenodo
+10.5281/zenodo.4063986, pinned by sha256 in `aila_benchmark.py`.
+
+**`pool`** ranks AILA's own pool with our stack — BM25, BGE-base dense
+(500-word chunks, best chunk per document, as ingestion's size-based
+chunker), RRF fusion (k=60, as production), optional MiniLM rerank of the
+top 30 — and scores the track's measures over the full ranking. It also
+writes a TREC run file. No database needed. Metric code checked against
+trec_eval (`pytrec_eval`): identical to 4 decimals on all four measures.
+
+**`export`** maps AILA's relevant judgments onto our corpus (title + year
+through the citation resolver, exact-name matches only) and writes a
+`judgment_eval.py` gold set (`kind: aila`, grouped by train/test) that
+scores production retrieval over the whole corpus. Precedents only — AILA's
+statutes are IPC/CrPC/Constitution sections, the corpus has the Sanhitas.
+Needs the DB; not yet run, so the mapping rate is unknown.
+
+### Results on the AILA pool (test queries Q11–50, n=40)
+
+| Task | Run | MAP | P@10 | BPREF | RR |
+|---|---|---|---|---|---|
+| Precedents | BM25 (ours) | 0.1333 | 0.0575 | 0.1160 | 0.2557 |
+| Precedents | best 2019 run (HLJIT task1 2) | 0.1492 | 0.0700 | 0.1286 | 0.288 |
+| Precedents | 2019 BM25 run (HLJIT task1 1) | 0.1335 | 0.0600 | 0.1134 | 0.282 |
+| Statutes | BM25 (ours) | 0.0756 | 0.0475 | 0.0423 | 0.1937 |
+| Statutes | BGE dense | 0.0753 | 0.0425 | 0.0383 | 0.1735 |
+| Statutes | hybrid (RRF) | 0.0790 | 0.0325 | 0.0435 | 0.1918 |
+| Statutes | hybrid + MiniLM rerank | 0.0820 | 0.0400 | 0.0471 | 0.1654 |
+| Statutes | best 2019 run (thuir legal 2) | 0.1566 | 0.0975 | 0.0961 | 0.281 |
+
+- Our BM25 lands on the published BM25 run (0.1333 vs 0.1335), which is a
+  good check that the adapter and metrics are right.
+- Statutes: hybrid and rerank move MAP by under 0.01 on 40 queries — noise.
+  We sit at half the best 2019 run, which summarised the query first;
+  AILA queries are 300–600-word situations and BGE truncates at 512 tokens.
+- **Precedent dense / hybrid / rerank not yet run**: embedding the pool is
+  ~21k chunks, too slow on a laptop CPU (stopped after 30+ min). Run on the
+  server GPU; embeddings are cached in `benchmark/work/aila/`.
+
+### IL-TUR
+
+`Exploration-Lab/IL-TUR` on Hugging Face is gated (accept the terms on the
+dataset page, then use an HF token) and CC BY-NC-SA. Of its tasks, PCR
+(prior case retrieval: 237 test query judgments, 1.7k candidates, µF1@K)
+fits the same `pool` design; LSI is IPC-section classification, which our
+system doesn't do. Not integrated yet, pending access.
+
+```bash
+cd NLPv2/backend
+python benchmark/aila_benchmark.py download
+for r in bm25 dense hybrid; do python benchmark/aila_benchmark.py pool --task cases --retriever $r; done
+python benchmark/aila_benchmark.py pool --task cases --retriever hybrid --rerank
+python benchmark/aila_benchmark.py export --version v1
+python benchmark/judgment_eval.py --gold benchmark/data/aila_gold_v1.json
+python tests/smoke_test_aila.py
+```
+
+## Results (2026-11-09, server): BM25 OR mode, case lookup, AILA
+
+### BM25 AND vs OR (issue #12) — final hit@8 unless noted
+
+| Set | AND | OR | BM25 latency AND → OR |
+|---|---|---|---|
+| masked citation, passage (n=500) | 0.200 [0.166, 0.236] | 0.242 [0.206, 0.280] | 45 ms → **3,667 ms** |
+| masked citation, `query_short` | 0.070 | 0.078 | 32 ms → 776 ms |
+| synthetic set, judgment recall@8 (n=80) | 0.625 | 0.650 | — |
+| case lookup, all (n=648) | **0.397** | 0.309 | 21 ms → 478 ms |
+| case lookup, citation (n=63) | **0.730** | **0.016** | |
+| case lookup, party name (n=191) | **0.309** | 0.225 | |
+
+- OR gives BM25 candidates for every passage query (usable for 500/500 vs
+  57/500) and the reranker stops hurting there (stage 1 0.220 → final
+  0.242), but the gain is within overlapping CIs.
+- **OR breaks citation lookup**: in "AIR 1978 SC 597" the terms `air`,
+  `sc`, `1978` exceed the 5% chunk-frequency cut, leaving `597` alone;
+  AND's requirement that all four co-occur is what made citations work.
+- Latency rules OR out as the default regardless: 3.7 s per BM25 call on
+  passage queries, ~0.5 s on short ones.
+- **Not merged as is.** Next: AND first, fill remaining slots from a
+  narrower OR (max_df ~1%, ~12 terms) under a statement timeout.
+
+### Case-name / citation lookup v1 (issue #11) — final hit@8, n=648
+
+| Retriever | all | citation | full_name | party_name | question |
+|---|---|---|---|---|---|
+| hybrid (production, AND) | 0.397 | 0.730 | 0.376 | 0.309 | 0.396 |
+| dense only | 0.261 | 0.048 | 0.350 | 0.110 | 0.386 |
+| **Graph alias lookup** | **0.977** | **1.000** | **1.000** | **0.921** | **1.000** |
+
+Builder: 200 judgments → 648 records (137 judgments had no reporter
+citation, 9 party names and 3 titles named >5 judgments).
+
+Chat finds a case the user names in the top 8 only 40% of the time; the
+alias table already in the codebase does it 98% of the time, including
+"What was held in X v. Y?". Routing queries that contain a resolvable
+citation or case title through the alias table is the largest gain any
+benchmark here has shown. BM25 (AND) carries citation queries — dense
+alone gets 5%.
+
+### AILA 2019 precedent retrieval, AILA pool, test Q11–50 (issue #15)
+
+| Run | MAP | P@10 | BPREF | RR |
+|---|---|---|---|---|
+| BM25 | **0.1333** | 0.0575 | 0.1160 | 0.2557 |
+| BGE dense | 0.0598 | 0.0350 | 0.0312 | 0.1130 |
+| hybrid (RRF) | 0.1059 | 0.0525 | 0.0860 | 0.2217 |
+| hybrid + MiniLM rerank | 0.0859 | 0.0350 | 0.0614 | 0.1896 |
+| best 2019 run | 0.1492 | 0.0700 | 0.1286 | 0.288 |
+
+Dense retrieval is weak on these 300–600-word fact situations (BGE
+truncates at 512 tokens and is not legal-domain), fusing it pulls BM25
+down, and the MS MARCO reranker lowers MAP again — the same direction as on
+the masked-citation passages. Our production stack (hybrid + rerank) is
+below plain BM25 on AILA.
+
+**Mapped onto the corpus** (`export --version v1`): 1,101 / 2,914 AILA
+cases map by exact name (591 fuzzy and 116 ambiguous left out), 102 / 186
+relevant cases; 43 queries keep at least one. Production retrieval:
+final hit@8 0.093 [0.023, 0.186], MRR 0.063; BM25 (AND) had no usable
+candidate for 41/43 queries. Too few queries for more than a sanity check.
+
+### Pattern across the four sets
+
+- Long, situation-style queries: BM25 (when it can fire) > hybrid > dense;
+  the MiniLM reranker hurts.
+- Short, name/citation queries: AND-BM25 is essential, the reranker helps
+  a little, and a direct alias lookup beats everything.
+
+## Update (2026-11-09): case lookup in chat + BM25 `and_or` (issue #12) — not yet measured
+
+Two changes, following the results above:
+
+1. **Case lookup in chat retrieval.** `retrieve_judgment_candidates` now
+   checks the query for reporter citations and "X v. Y" titles and resolves
+   them with the citation-graph resolver (`resolve_citations`; only
+   `reporter` / `exact_name` resolutions are trusted). A "<Name> case"
+   mention is matched against `judgment_aliases` party names and used only
+   when it names ≤4 judgments. Each named judgment's chunk closest to the
+   query is put first, marked `exact_match`, and
+   `CrossEncoderReranker.rerank_keep_pinned` keeps it first through
+   reranking — the mechanism statutes already used for "section N" (chat's
+   `_rerank_statutes` now calls the same method). Needs a graph manager;
+   chat always has one. Evals: `--case-lookup on|off`.
+2. **BM25 `and_or` (new default).** AND (`plainto_tsquery`) first; if it
+   returns fewer than `candidate_k` chunks, the remaining slots are filled
+   from an OR query over the ≤12 rarest query terms found in ≤1% of chunks,
+   under a 500 ms `statement_timeout` (on timeout the AND results are kept).
+   `and` and `or` remain for ablations. Evals report
+   `bm25_stats` (calls, fills, fill_timeouts) and how many queries had a
+   pinned / relevant pinned judgment.
+
+Checked offline (`tests/smoke_test_bm25_or.py`) and against a scratch
+pgvector Postgres with the real schema: citation, title and party-name
+lookup resolve; pinned chunk first; AND rows then OR fill with no duplicate;
+forced timeout falls back to the AND rows.
+
+```bash
+cd NLPv2/backend
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/case_lookup_gold_v1.json --case-lookup off
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json
+python benchmark/judgment_eval.py --gold benchmark/data/masked_citation_gold_v1.json --query-field query_short
+python benchmark/retrieval_eval.py --gold benchmark/data/gold_set.json
+python benchmark/judgment_eval.py --gold benchmark/data/aila_gold_v1.json
+```
+
+### Results (2026-11-09, server) and follow-up
+
+Final hit@8 (stage 2):
+
+| Set | AND (before) | `and_or`, lookup off | `and_or` + lookup |
+|---|---|---|---|
+| case lookup, all (n=648) | 0.397 | 0.491 | **0.656** [0.619, 0.691] |
+| — citation / full_name / party / question | 0.73 / 0.38 / 0.31 / 0.40 | 0.73 / 0.47 / 0.45 / 0.48 | **0.97 / 0.63 / 0.61 / 0.63** |
+| masked citation, passage | 0.200 | — | 0.206 |
+| masked citation, `query_short` | 0.070 | — | 0.086 |
+| synthetic, judgment recall@8 | 0.625 | — | 0.662 |
+| AILA mapped (n=43) | 0.093 | — | 0.093 |
+
+- Lookup pinned a judgment for 298/648 case-lookup queries (276 relevant)
+  and for 4/500 masked-citation queries (none relevant — stray titles).
+- The fill helped short queries (case lookup without pinning 0.397 →
+  0.491), but on passages it timed out 856/990 times and on AILA 86/86,
+  raising BM25 latency 45 → 519 ms for no gain.
+
+Follow-up (not yet measured):
+- Titles were pinned for only ~half of the full-name / question queries:
+  the title regex stops at commas and "M/S.", and the resolver refuses a
+  name shared by connected appeals. Lookup now also matches every full case
+  name contained in the normalised query (longest names only, ≤4
+  judgments), as the Graph search does; "<Name> case" accepts "M/S." and
+  "for/in/on/to/&".
+- The fill is skipped for queries with >30 distinct lexemes and uses ≤8
+  terms (was 12).
+
+### Results after the follow-up (2026-11-09, server, b3ed2a2)
+
+| Set | AND, no lookup (before #12) | now (`and_or` + lookup) | BM25 latency |
+|---|---|---|---|
+| case lookup, all (n=648) | 0.397 | **0.903** [0.880, 0.924] | 146 ms |
+| — citation (63) | 0.730 | 0.968 | |
+| — full_name (197) | 0.376 | **1.000** | |
+| — question (197) | 0.396 | **1.000** | |
+| — party_name (191) | 0.309 | 0.681 | |
+| masked citation, passage | 0.200 | 0.200 | 95 ms (fill skipped 856/1000 calls) |
+| masked citation, `query_short` | 0.070 | 0.082 | 262 ms (140/882 fills timed out) |
+| AILA mapped (n=43) | 0.093 | 0.093 | 57 ms (fill skipped 86/86) |
+
+Lookup pinned 557/648 case-lookup queries (535 relevant); on the masked
+set it pinned 7/500 and AILA 1/43, none relevant (titles that survived
+masking / appear in fact descriptions) — a small cost of one result slot.
+Long queries are back to AND latency with no quality change. Remaining gap:
+party-name queries 0.681 vs 0.921 for the Graph search, which matches
+substrings of either party (we require an exact party side and ≤4 matches).
+
+### Party-name lookup rewrite and 200 ms fill (2026-11-10, server, d288351)
+
+Changes: "<Name> case" now tries every run of up to 12 normalised words
+before "case" against the aliases' party sides, longest first (the old
+capitalised-words regex lost names with commas, brackets, "A." initials or
+more than six words); the pin cap is 5 (was 4; the gold set keeps queries
+with up to 5 relevant judgments); spans ending in "present", "prosecution",
+"appellant's" etc. are skipped. The OR fill timeout went from 500 to 200 ms.
+
+| Set | b3ed2a2 | d288351 | BM25 latency (b3ed2a2 → d288351) |
+|---|---|---|---|
+| case lookup, all (n=648) | 0.903 | **0.921** [0.900, 0.941] | 146 → 116 ms |
+| — citation (63) | 0.968 | 0.968 | |
+| — full_name (197) | 1.000 | 1.000 | |
+| — question (197) | 1.000 | 1.000 | |
+| — party_name (191) | 0.681 | **0.743** | |
+| case lookup, lookup off | 0.491 | 0.491 | |
+| masked citation, passage | 0.200 | 0.198 | 95 → 70 ms |
+| masked citation, `query_short` | 0.082 | 0.072 [0.050, 0.096] | 262 → 166 ms (fill timeouts 140 → 471 of 882) |
+| synthetic, judgment recall@8 | 0.662 (35f5d61) | 0.637 | (fill timeouts 35/77) |
+| AILA mapped (n=43) | 0.093 | 0.093 | 57 ms (fill skipped 86/86) |
+
+- Lookup pinned 569/648 case-lookup queries, 567 of them relevant (was
+  557 / 535), so the longer party runs pin more and more precisely. On the
+  masked set it pinned 8/500 (passage) and 2/500 (short), AILA 1/43; none
+  relevant, as before.
+- Party-name queries are still 0.743 against 0.921 for the Graph search.
+- The 200 ms timeout more than tripled the fill timeouts. Short queries
+  lost about the gain the fill had brought (0.082 → 0.072; AND-only was
+  0.070) and synthetic judgment recall fell 0.662 → 0.637, both within
+  the CIs, for ~100 ms less BM25 time per call.
+
+### Role labels dropped from party names (2026-11-10, server, ea9c267)
+
+48 of the 49 party-name misses left after d288351 were judgments whose
+stored parties carry the newer Supreme Court header role labels
+("P.EKNATH ...Appellant(s)", "Ratan Lal .. Respondent"): their aliases read
+"p eknath appellant s v ...", so neither the lookup nor citation titles
+naming them could match. `normalize_case_name` now drops
+appellant/respondent/petitioner(s) at the end of a party,
+`clean_party_name` cuts "WITH CIVIL APPEAL NO. ..." tagged-matter notes,
+"<Name>'s case" is looked up as <Name>, and the fill timeout is back to
+500 ms. Aliases and edges were rebuilt (`build_citation_edges.py
+--rebuild`, `compute_graph_stats.py`):
+
+- aliases with a trailing role label: 19,344 judgments → 26
+- citation edges 491,855 → 493,621; 167,337 resolved (reporter 67,369,
+  exact name 71,036, fuzzy 28,932), 17,434 ambiguous, 308,850 unresolved;
+  110,819 distinct judgment-to-judgment links for PageRank
+
+| Set | d288351 | ea9c267 | BM25 latency (ea9c267) |
+|---|---|---|---|
+| case lookup, all | 0.921 (n=648) | **0.994** [0.988, 0.998] (n=642) | 143 ms (fill timeouts 24/1208) |
+| — citation | 0.968 | 0.968 | |
+| — full_name | 1.000 | 1.000 | |
+| — question | 1.000 | 1.000 | |
+| — party_name | 0.743 | **0.989** | |
+| masked citation, passage | 0.198 | 0.200 | 95 ms |
+| masked citation, `query_short` | 0.072 | **0.088** [0.064, 0.114] | 260 ms (fill timeouts 130/882) |
+| synthetic, judgment recall@8 | 0.637 | 0.650 | (fill timeouts 12/77) |
+| AILA mapped (n=43) | 0.093 | 0.093 | 57 ms |
+
+- Lookup pinned 629/642 case-lookup queries, every one relevant.
+- 6 case-lookup records were excluded as stale: the "WITH CIVIL APPEAL"
+  cut changed those judgments' case names beyond what re-normalising the
+  stored name recovers (e.g. the Moti Ratan Estate query). n is 642, not 648.
+- Pins on non-lookup sets: masked passage 13/500 (was 8), short 3/500,
+  AILA 1/43, none relevant. The extra passage pins come from names that
+  survive masking; hit@8 is unchanged.
+- BM25 returned something usable far more often (case lookup: no usable
+  candidate 124 → 9; short queries 210 → 73) with 500 ms back.
+
+Against the start of #12 (AND, no lookup): case lookup 0.397 → 0.994,
+`query_short` 0.070 → 0.088, passage and AILA unchanged, synthetic
+0.625 → 0.650.
+
+## Update (2026-11-20): other embedding models, alongside the BGE baseline — not yet run
+
+The benchmarks above point at the embedder: dense-only AILA MAP 0.060 against
+BM25's 0.133, and a cited judgment outside the top 30 for 65% of masked
+passages. BGE-base is general-domain and reads 512 tokens.
+
+**Setup shared by every model** (`retrieval/embedding_models.py`):
+- Each model has its own tables (`judgment_embeddings_<key>`,
+  `statute_embeddings_<key>`) keyed on the same `chunk_id` / `section_id`, so
+  models are compared on identical chunks. The BGE tables are never written.
+- `RAG_EMBEDDING_MODEL=<key>` picks the model retrieval, chat and the evals
+  read (default `bge`). Reports and MLflow runs record it.
+- `ingestion/backfill_embeddings.py --model <key>` fills a model's tables
+  from the stored chunk text: resumable, `--limit N` for a throughput sample,
+  HNSW index built once complete. Each table's comment records the weights
+  that filled it.
+- `benchmark/check_embedding_model.py --embedding-model <key>` shows the
+  prompts, pooling and widths actually used, runs a small legal sanity check
+  and measures throughput, before any long run.
+- `aila_benchmark.py pool --embedding-model <key>` scores a model on the AILA
+  pool without touching the database, at any width (full-width vectors are
+  cached once and cut in memory).
+- Non-baseline models skip the 0.2 dense cut-off (tuned on BGE's similarity
+  scale) and keep the top k.
+
+**Euler-Legal-Embedding-V1** (`Mira190/Euler-Legal-Embedding-V1`): a LoRA
+legal fine-tune of Qwen3-Embedding-8B, 4,096 dims, 1,536 tokens, last-token
+pooling. Used as is (no training here). Keys:
+
+| key | model | role |
+|---|---|---|
+| `euler` | Euler-Legal-Embedding-V1 | the experiment |
+| `qwen3_8b` | Qwen/Qwen3-Embedding-8B | control: what the legal fine-tune adds |
+| `qwen3_06b` | Qwen/Qwen3-Embedding-0.6B (1,024 dims) | light option for production |
+
+- pgvector's HNSW indexes at most 4,000 dims (`halfvec`), so the 8B models
+  are stored Matryoshka-truncated to `EULER_DIM` (default 2,048, `halfvec`);
+  tables are named by width (`judgment_embeddings_euler_2048`). Whether
+  Euler keeps its quality when truncated is unverified: compare 4,096 /
+  2,048 / 1,024 on the AILA pool first.
+- Query prompt: the model's own (from its sentence-transformers config)
+  unless `QWEN_QUERY_INSTRUCT` sets a task, giving Qwen3's
+  `Instruct: <task>\nQuery:` format. Documents get none.
+- Unverified third-party upload: review the repo, then pin `EULER_REVISION`
+  to a commit; `trust_remote_code` stays off unless
+  `EULER_TRUST_REMOTE_CODE=1`.
+- Cost: about 16 GB of bf16 weights, so loading it for chat sits next to
+  Qwen-7B on the A6000, and every query goes through an 8B model.
+  Record latency and table size beside quality.
+- Our chunks were cut for BGE (~500 words), so the longer window mainly
+  helps long queries such as AILA's fact situations.

@@ -1,0 +1,36 @@
+{
+  "description": "Government commentary sources for commentary_gold.py. PDFs live in <repo>/data/commentary/ (DVC). sha256 pins the exact file each gold set was built from. Official SCR headnotes are excluded on purpose: the JUDIS corpus already contains them.",
+  "sources": [
+    {
+      "source_id": "lcr262",
+      "title": "Law Commission of India, Report No. 262: The Death Penalty (August 2015)",
+      "publisher": "Law Commission of India",
+      "type": "law_commission_report",
+      "file": "lcr_262_death_penalty.pdf",
+      "url": "https://www.delhihighcourt.nic.in/files/reports/262.pdf",
+      "sha256": "df5fcb7c5e561763291deb9b3e60f1ef85728057dffee8dad96b1f6db9c9d431",
+      "topics": ["criminal law", "sentencing", "death penalty"]
+    },
+    {
+      "source_id": "lcr268",
+      "title": "Law Commission of India, Report No. 268: Amendments to Criminal Procedure Code, 1973 - Provisions Relating to Bail (May 2017)",
+      "publisher": "Law Commission of India",
+      "type": "law_commission_report",
+      "file": "lcr_268_bail.pdf",
+      "url": "https://cdnbbsr.s3waas.gov.in/s3ca0daec69b5adc880fb464895726dbdf/uploads/2022/08/2022081637-1.pdf",
+      "sha256": "bceacc7708a1ac0ea55cb3da8693f2936502a33c7ad3ae4c1a433b4e04984a02",
+      "topics": ["criminal procedure", "bail"]
+    },
+    {
+      "source_id": "lcr277",
+      "title": "Law Commission of India, Report No. 277: Wrongful Prosecution (Miscarriage of Justice): Legal Remedies (August 2018)",
+      "publisher": "Law Commission of India",
+      "type": "law_commission_report",
+      "file": "lcr_277_wrongful_prosecution.pdf",
+      "url": "https://static.pib.gov.in/WriteReadData/userfiles/Report%20No.%20277%20Wrongful%20Prosecution.pdf",
+      "sha256": "b633150ac8a5a4faf9e757fbc85958d19d59f3fad00d1026a42d97b758843d5a",
+      "topics": ["criminal procedure", "compensation", "malicious prosecution"],
+      "notes": "Scanned: no usable text layer, extracted by OCR."
+    }
+  ]
+}

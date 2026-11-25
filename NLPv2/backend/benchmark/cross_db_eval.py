@@ -123,10 +123,8 @@ def score(rank, k):
     return 1.0 if rank is not None and rank <= k else 0.0
 
 
-def run_db(dbname, records, key, cand_k, thr, top_k):
-    from retrieval.retriever import LegalRetriever
-    from retrieval.reranker import CrossEncoderReranker
-    retr, rer = LegalRetriever(db_connection_string=dsn(dbname)), CrossEncoderReranker()
+def run_db(dbname, records, key, cand_k, thr, top_k, retr, rer):
+    retr.db_connection_string = dsn(dbname)   # one model load shared by both DBs
     out = []
     for i, r in enumerate(records):
         s1 = retr.retrieve_judgment_candidates(query=r["query"], candidate_k=cand_k, similarity_threshold=thr)
@@ -149,8 +147,13 @@ def summarize(res):
 
 def cmd_eval(a):
     gold = json.load(open(a.gold))["records"]
-    old = run_db(a.old_db, gold, "old_id", a.candidate_k, a.threshold, a.top_k)
-    new = run_db(a.new_db, gold, "new_id", a.candidate_k, a.threshold, a.top_k)
+    from retrieval.retriever import LegalRetriever
+    from retrieval.reranker import CrossEncoderReranker
+    retr = LegalRetriever(db_connection_string=dsn(a.old_db), embedding_model=a.embedding_model)
+    rer = CrossEncoderReranker()
+    print(f"embedding model: {retr.embedding_spec.key} ({retr.embedding_spec.model_id}); tables: {retr.embedding_spec.judgment_table}")
+    old = run_db(a.old_db, gold, "old_id", a.candidate_k, a.threshold, a.top_k, retr, rer)
+    new = run_db(a.new_db, gold, "new_id", a.candidate_k, a.threshold, a.top_k, retr, rer)
     so, sn = summarize(old), summarize(new)
     print(f"\n{'metric':<18}{'old':>9}{'new':>9}{'diff':>9}")
     for k in so:
@@ -200,6 +203,7 @@ def main():
     e.add_argument("--candidate-k", type=int, default=30)
     e.add_argument("--threshold", type=float, default=0.2)
     e.add_argument("--top-k", type=int, default=8)
+    e.add_argument("--embedding-model", default=None, help="bge (default), euler, qwen3_8b ... (RAG_EMBEDDING_MODEL keys); both DBs need that model's tables")
     e.add_argument("--out", default=None)
     a = ap.parse_args()
     (cmd_build if a.cmd == "build" else cmd_eval)(a)

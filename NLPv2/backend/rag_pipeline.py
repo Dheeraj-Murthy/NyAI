@@ -261,11 +261,7 @@ class LegalRAGPipeline:
         unconditionally — the cross-encoder scores terse statute text against
         prose-heavy queries inconsistently, and would otherwise re-sort the
         guaranteed exact match right out of the final top_n."""
-        exact = [c for c in statute_candidates if c.get("exact_match")]
-        rest = [c for c in statute_candidates if not c.get("exact_match")]
-        remaining_slots = max(self.statute_top_k - len(exact), 0)
-        reranked_rest = self.reranker.rerank(query, rest, top_n=remaining_slots)
-        return exact[: self.statute_top_k] + reranked_rest
+        return self.reranker.rerank_keep_pinned(query, statute_candidates, top_n=self.statute_top_k)
 
     def _build_metrics(
         self,
@@ -329,7 +325,7 @@ class LegalRAGPipeline:
 
             # ✅ STAGE 2: reranking — statutes first in the final list
             reranked_statutes = self._rerank_statutes(user_query, statute_candidates)
-            reranked_judgments = self.reranker.rerank(
+            reranked_judgments = self.reranker.rerank_keep_pinned(
                 user_query, judgment_candidates, top_n=self.stage2_k
             )
             retrieved_chunks = reranked_statutes + reranked_judgments
@@ -567,7 +563,7 @@ class LegalRAGPipeline:
                     similarity_threshold=self.statute_similarity_threshold,
                 )
                 reranked_statutes = self._rerank_statutes(doc_query, statute_candidates)
-                reranked_judgments = self.reranker.rerank(
+                reranked_judgments = self.reranker.rerank_keep_pinned(
                     doc_query, judgment_candidates, top_n=self.stage2_k
                 )
                 retrieved_chunks = reranked_statutes + reranked_judgments
@@ -872,7 +868,7 @@ class LegalRAGPipeline:
                 similarity_threshold=self.statute_similarity_threshold,
             )
             reranked_statutes = self._rerank_statutes(search_query, statute_candidates)
-            reranked_judgments = self.reranker.rerank(
+            reranked_judgments = self.reranker.rerank_keep_pinned(
                 search_query, judgment_candidates, top_n=self.stage2_k
             )
             retrieved_chunks = reranked_statutes + reranked_judgments

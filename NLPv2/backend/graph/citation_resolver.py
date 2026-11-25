@@ -138,6 +138,11 @@ _STATE_ABBREVIATIONS = {
 _STATE_ABBR_RE = re.compile(r"\bstate of (m ?p|u ?p|a ?p|h ?p|w ?b|t ?n|j ?and ?k|j ?k)\b")
 _PARTY_SUFFIX_RE = re.compile(r"\b(?:and )?(?:ors|others|anr|another|etc)\b")
 _SEPARATOR_RE = re.compile(r"\b(?:versus|vs|v)\b\.?")
+# Role labels newer Supreme Court headers put on the party lines
+# ("P.EKNATH ...Appellant(s)", "Ratan Lal .. Respondent"); after punctuation
+# is removed "(s)" is a separate "s". Only at the end of a party, so
+# "Petitioners Association" keeps its name.
+_ROLE_LABEL_RE = re.compile(r"\b(?:appellant|respondent|petitioner)s?(?:\s+s)?(?=\s+v\s|\s*$)")
 
 # Words too common in Indian case titles to identify a case on their own:
 # connectives, honorifics, and the government bodies and company words that
@@ -158,6 +163,8 @@ def normalize_case_name(name: str) -> str:
 
     >>> normalize_case_name("The State of M.P. & Ors. Vs. Ram Kumar")
     'state of madhya pradesh v ram kumar'
+    >>> normalize_case_name("P.EKNATH ...Appellant(s) Vs. Y. Amaranatha Reddy ...Respondent(s)")
+    'p eknath v y amaranatha reddy'
     """
     if not name:
         return ""
@@ -170,6 +177,7 @@ def normalize_case_name(name: str) -> str:
     )
     s = re.sub(r"\bu ?o ?i\b", "union of india", s)
     s = _PARTY_SUFFIX_RE.sub(" ", s)
+    s = _ROLE_LABEL_RE.sub(" ", s)
     s = re.sub(r"\bm s\b", " ", s)
     tokens = [t for t in s.split() if t != "the"]
     return " ".join(tokens)
@@ -182,6 +190,8 @@ _PARTY_JUNK_RES = [
     re.compile(r"\b(?:" + _MONTHS + r")\s+\d.*$", re.I | re.S),   # "OCTOBER 12, 1954. ..."
     re.compile(r"\(\s*(?:and|with|c\b)[^)]*\)?.*$", re.I | re.S), # "(AND CONNECTED APPEALS)"
     re.compile(r"\band connected\b.*$", re.I | re.S),
+    # "... WITH CIVIL APPEAL NO. 6998 OF 2019 (Arising from SLP ..." tagged-matter notes
+    re.compile(r"\bwith\s+(?:civil|criminal|writ|special|transfer|contempt|review|s\.?\s?l\.?\s?p)\b.*$", re.I | re.S),
     re.compile(r"-{2,}\s*intervener.*$", re.I | re.S),
     re.compile(r"\(\s*dead\s*\)\s*(?:by|through)?\s*(?:legal representatives?|l\.?\s?rs?\.?)?", re.I),
 ]

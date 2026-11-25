@@ -160,6 +160,9 @@ logs/
 
 # benchmark run output (regenerated per run; gold_set.json itself is tracked)
 NLPv2/backend/benchmark/reports/
+# commentary_gold.py intermediates (OCR page cache, candidates, review.csv);
+# the finalized benchmark/data/commentary_gold_<version>.json is tracked
+NLPv2/backend/benchmark/work/
 
 # =========================
 # Misc
