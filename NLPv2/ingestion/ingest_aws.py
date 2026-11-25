@@ -32,96 +32,10 @@ from psycopg2.extras import execute_values
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ingest import (  # noqa: E402  (also puts backend/ on sys.path)
-    chunk_judgment_text,
-    extract_text_from_pdf,
-    get_embeddings_batch,
-)
+from ingest import extract_text_from_pdf, get_embeddings_batch  # noqa: E402  (also puts backend/ on sys.path)
+from scr_chunker import chunk_scr, clean_to_paragraphs, context_prefix  # noqa: E402
 from db_schema import ensure_schema  # noqa: E402
 from documents import relative_source_path  # noqa: E402
-
-# --------------------------------------------------------------------------
-# Text cleaning for S.C.R. law-report PDFs
-# --------------------------------------------------------------------------
-
-# Running page headers, e.g. "[2008] 12 S.C.R. 28", "1035 SUPREME COURT REPORTS [1955] 1 S.C.R."
-_RUNNING_HEADER_RES = [
-    re.compile(r"^\s*\[\d{4}\]\s+\d+\s+S\.?C\.?R\.?(\s+\d+)?\s*(:\s*\d{4}\s+INSC\s+\d+)?\s*$"),
-    re.compile(r"^\s*(\d{1,4}\s+)?(S\.?C\.?R\.?\s+)?SUPREME COURT REPORTS.*$", re.I),
-    re.compile(r"^\s*\[\d{4}\]\s+\d+\s+S\.?C\.?R\.?\s*$"),
-]
-_MARGIN = "ABCDEFGH"
-
-
-def _is_title_header(line: str) -> bool:
-    """First line of pages 2+: 'STATE (NCT OF DELHI) v. AHMED JAAN   29' or '1035 ...'."""
-    s = line.strip()
-    if not s or len(s) > 140:
-        return False
-    edge_num = re.match(r"^\d{1,4}\s+\S", s) or re.search(r"\s\d{1,4}$", s)
-    if not edge_num:
-        return False
-    letters = [c for c in s if c.isalpha()]
-    upper = sum(c.isupper() for c in letters)
-    return bool(letters) and (upper / len(letters) > 0.6 or re.search(r"\bv\.?\b|\bvs\.?\b", s, re.I) is not None)
-
-
-def _strip_margin_letters(lines):
-    """Remove the A-H side-margin markers of the printed law report. They run
-    in order down each page, so only strip a letter that equals the current
-    letter or advances it by one or two; a sentence-initial 'A' mid-page isn't
-    removed. Handles leading ('D cient cause') and trailing ('... suffi- B')
-    markers and lines that consist only of a marker."""
-    cur = -1
-    out = []
-    for ln in lines:
-        s = ln.rstrip()
-        stripped = s.strip()
-        if len(stripped) == 1 and stripped in _MARGIN:
-            # a line holding just one of A-H is a margin marker
-            cur = max(cur, _MARGIN.index(stripped))
-            continue
-        m = re.match(r"^\s*([A-H])(\s{2,}|\s+(?=\S))(.*)$", s)
-        if m:
-            idx = _MARGIN.index(m.group(1))
-            if cur < idx <= cur + 3 and (cur >= 0 or idx == 0 and len(m.group(2)) >= 2):
-                cur = idx
-                s = m.group(3)
-        m = re.match(r"^(.*\S)\s+([A-H])$", s)
-        if m:
-            idx = _MARGIN.index(m.group(2))
-            if cur < idx <= cur + 3:
-                cur = idx
-                s = m.group(1)
-        out.append(s)
-    return out
-
-
-def clean_scr_text(raw: str) -> str:
-    pages = raw.split("\f")
-    cleaned_pages = []
-    for pi, page in enumerate(pages):
-        lines = [ln for ln in page.split("\n")]
-        # drop running headers
-        kept = []
-        seen_first = False
-        for ln in lines:
-            if any(r.match(ln) for r in _RUNNING_HEADER_RES):
-                continue
-            if ln.strip() and not seen_first:
-                seen_first = True
-                if pi > 0 and _is_title_header(ln):
-                    continue
-            kept.append(ln)
-        kept = _strip_margin_letters(kept)
-        kept = [re.sub(r"[ \t]{2,}", " ", ln).strip() for ln in kept]
-        cleaned_pages.append("\n".join(kept))
-    text = "\n".join(cleaned_pages)
-    # join words hyphenated across a line break ("ac-\ncused" -> "accused")
-    text = re.sub(r"([a-z])-\n([a-z])", r"\1\2", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
 
 # --------------------------------------------------------------------------
 # Metadata mapping
@@ -205,7 +119,8 @@ def ingest_one(conn, row: dict, pdf: Path, embed: bool):
     raw = extract_text_from_pdf(str(pdf))
     if not raw.strip():
         return {"error": "no_text"}
-    text = clean_scr_text(raw)
+    paragraphs = clean_to_paragraphs(raw)
+    text = "\n\n".join(paragraphs)
     if len(text) < 500:
         return {"error": "short_text"}
     cur = conn.cursor()
@@ -219,9 +134,9 @@ def ingest_one(conn, row: dict, pdf: Path, embed: bool):
              row["cnr"], row["disposal"]),
         )
         jid = cur.fetchone()[0]
-        chunks = chunk_judgment_text(text)
-        valid = {"facts", "issues", "arguments", "ratio", "judgment"}
-        chunks = [(s if s in valid else "judgment", c) for s, c in chunks if c.strip()]
+        chunks = [(s, c) for s, c in chunk_scr(paragraphs) if c.strip()]
+        prefix = context_prefix(row["petitioner"], row["respondent"], row["date"], row["bench"],
+                                row["citations"]["reporters"], row["disposal"])
         rows = execute_values(
             cur,
             "INSERT INTO judgment_chunks (judgment_id, section, content) VALUES %s RETURNING chunk_id",
@@ -229,7 +144,8 @@ def ingest_one(conn, row: dict, pdf: Path, embed: bool):
         )
         n_emb = 0
         if embed:
-            embs = get_embeddings_batch([c for _, c in chunks])
+            # embed with the case label attached; stored content stays clean
+            embs = get_embeddings_batch([prefix + "\n" + c for _, c in chunks])
             er = [(r[0], e) for r, e in zip(rows, embs) if e is not None]
             if er:
                 execute_values(cur, "INSERT INTO judgment_embeddings (chunk_id, embedding) VALUES %s", er)
