@@ -20,6 +20,9 @@ _RUNNING_HEADER_RES = [
     re.compile(r"^\s*(\d{1,4}\s+)?\[\d{4}\]\s+(\d+\s+|SUPP\.?\s*\d*\s+)?S\.?C\.?R\.?(\s+\d+)?\s*(:\s*\d{4}\s+INSC\s+\d+)?\s*\d*\s*$", re.I),
     re.compile(r"^\s*(\d{1,4}\s+)?(DIGITAL\s+)?(S\.?C\.?R\.?\s+)?SUPREME COURT REPORTS\s*(\[\d{4}\].*)?\s*\d*\s*$", re.I),
     re.compile(r"^\s*\d{1,4}\s*$"),  # lone page number
+    re.compile(r"^\s*\*?\s*Author\s*$", re.I),                              # 2024+ front matter
+    re.compile(r"^\s*Judgment\s*/\s*Order of the Supreme Court\s*$", re.I),
+    re.compile(r"^\s*_?\s*Headnotes prepared by:.*$", re.I),
 ]
 
 
@@ -36,7 +39,16 @@ def _is_title_header(line: str) -> bool:
 
 
 def _norm(line: str) -> str:
-    return re.sub(r"\d+", "#", _CTRL.sub(" ", line)).strip()
+    s = re.sub(r"\d+", "#", _CTRL.sub(" ", line)).strip()
+    s = re.sub(r"^[A-H]\s{2,}", "", s)
+    s = re.sub(r"\s+[A-H]$", "", s)         # margin letter on the same line as a header
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _zone_indices(lines):
+    """Indices of the lines where running headers/footers live: the first 3 and last 2 non-empty lines."""
+    idx = [i for i, l in enumerate(lines) if l.strip()]
+    return set(idx[:3]) | set(idx[-2:])
 
 
 def _page_lines(page: str, first_page: bool, drop_norms=frozenset()):
@@ -94,13 +106,19 @@ def clean_to_paragraphs(raw: str) -> List[str]:
     # Lines that repeat on at least half the pages (after masking digits) are
     # running headers/footers the patterns above didn't know about.
     counts = {}
+    zones = []
     for page in pages:
-        for ln in set(_norm(l) for l in page.split("\n") if l.strip()):
+        lines = page.split("\n")
+        z = _zone_indices(lines)
+        zones.append(z)
+        for ln in set(_norm(lines[i]) for i in z):
             counts[ln] = counts.get(ln, 0) + 1
-    thresh = max(4, len(pages) // 2)
+    thresh = max(3, len(pages) // 4)
     drop_norms = frozenset(n for n, c in counts.items() if c >= thresh and 3 <= len(n) <= 90 and n.replace("#", "").strip(" .:-"))
     for pi, page in enumerate(pages):
-        seq.extend(_page_lines(page, first_page=(pi == 0), drop_norms=drop_norms))
+        lines = page.split("\n")
+        kept = [l for i, l in enumerate(lines) if not (i in zones[pi] and _norm(l) in drop_norms)]
+        seq.extend(_page_lines("\n".join(kept), first_page=(pi == 0)))
     paras, cur, prev_indent, prev_text = [], [], 0, ""
 
     def flush():
