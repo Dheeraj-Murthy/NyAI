@@ -45,6 +45,16 @@ def norm_name(s):
     return " ".join(sorted(set(toks)))
 
 
+def match_cases_cnr(old_cur, new_cur):
+    """Exact match on cnr, for two DBs built from the same AWS dataset (e.g. v2 vs v3)."""
+    old_cur.execute("SELECT cnr, id FROM judgments WHERE cnr IS NOT NULL")
+    old = dict(old_cur.fetchall())
+    new_cur.execute("SELECT cnr, id, date_of_judgment FROM judgments WHERE cnr IS NOT NULL")
+    pairs = [{"new_id": i, "old_id": old[c], "date": d} for c, i, d in new_cur.fetchall() if c in old and d]
+    print(f"matched by cnr: {len(pairs)}")
+    return pairs
+
+
 def match_cases(old_cur, new_cur):
     old_cur.execute("SELECT id, petitioner, respondent, date_of_judgment FROM judgments")
     old = defaultdict(list)
@@ -71,7 +81,7 @@ def match_cases(old_cur, new_cur):
 def cmd_build(a):
     from benchmark.generate_gold_set import _resolve_backend, generate_question_for_chunk, _is_garbled, _question_overlap, MIN_QUESTION_OVERLAP
     oc, nc = psycopg2.connect(dsn(a.old_db)), psycopg2.connect(dsn(a.new_db))
-    pairs = match_cases(oc.cursor(), nc.cursor())
+    pairs = (match_cases_cnr if a.match == "cnr" else match_cases)(oc.cursor(), nc.cursor())
     by_dec = defaultdict(list)
     for p in pairs:
         by_dec[p["date"].year // 10 * 10].append(p)
@@ -179,6 +189,7 @@ def main():
         p.add_argument("--new-db", default="legal_rag_v3")
     b = sub.choices["build"]
     b.add_argument("--n", type=int, default=240)
+    b.add_argument("--match", choices=["name", "cnr"], default="name", help="cnr: for DBs built from the same AWS dataset")
     b.add_argument("--seed", type=int, default=42)
     b.add_argument("--model", default=None)
     b.add_argument("--external-ok", action="store_true")
