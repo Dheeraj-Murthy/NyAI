@@ -4,13 +4,13 @@ from lib import api_client
 from lib.case_graph import case_label, render_case_graph_panel, render_path, selected_cases
 from lib.mind_map import render_mind_map
 from lib.network_view import render_network
+from lib.theme import page_header
 from lib.ui_helpers import linked_label, render_api_error
 
 
-st.set_page_config(page_title="Citation graph — Legal RAG", page_icon=":material/account_tree:", layout="wide")
+st.set_page_config(page_title="Explore precedents — NyAI", page_icon=":material/account_tree:", layout="wide")
 
-st.title("Citation graph", icon=":material/account_tree:")
-st.caption("Browse landmark cases and precedent networks derived from the judgment citation graph.")
+page_header("Explore precedents", "Browse landmark cases and precedent networks derived from the judgment citation graph.")
 
 NEIGHBOR_PAGE = 25
 NETWORK_PAGE = 50

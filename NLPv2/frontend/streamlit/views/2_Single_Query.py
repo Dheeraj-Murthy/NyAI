@@ -2,6 +2,7 @@ import streamlit as st
 
 from lib import api_client
 from lib.case_graph import answer_cases, render_case_graph_panel
+from lib.theme import page_header
 from lib.ui_helpers import (
     confidence_badge,
     render_api_error,
@@ -11,10 +12,9 @@ from lib.ui_helpers import (
     render_sectioned_sources_and_citations,
 )
 
-st.set_page_config(page_title="Single query — Legal RAG", page_icon=":material/search:", layout="wide")
+st.set_page_config(page_title="Single query — NyAI", page_icon=":material/search:", layout="wide")
 
-st.title("Single query", icon=":material/search:")
-st.caption("One-shot grounded Q&A with retrieval/generation controls, full metrics, and precedent chains.")
+page_header("Single query", "One-shot grounded Q&A with retrieval/generation controls, full metrics, and precedent chains.")
 
 with st.form("single_query_form"):
     query_text = st.text_area("Question", placeholder="What are the principles of natural justice?")
@@ -51,7 +51,7 @@ result = st.session_state.get("last_query_result")
 if result and result.get("error"):
     st.error(result["error"], icon=":material/error:")
 elif result:
-    with st.container(border=True):
+    with st.container(border=True, key="nyai-answer"):
         if not result.get("answer_found", True):
             st.warning(result["answer"], icon=":material/search_off:")
         else:

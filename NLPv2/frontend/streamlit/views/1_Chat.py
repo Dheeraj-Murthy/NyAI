@@ -4,6 +4,8 @@ import streamlit as st
 
 from lib import api_client
 from lib.case_graph import render_answer_graph
+from lib.home_page import SUGGESTIONS
+from lib.theme import hero, page_header
 from lib.ui_helpers import (
     confidence_badge,
     init_session_state,
@@ -27,16 +29,11 @@ def render_context_note(context) -> None:
     st.caption(":material/history: Context: " + " · ".join(parts))
 
 
-st.set_page_config(page_title="Chat — Legal RAG", page_icon=":material/chat:", layout="wide")
+st.set_page_config(page_title="Ask a question — NyAI", page_icon=":material/chat:", layout="wide")
 init_session_state()
 
-st.title("Chat", icon=":material/chat:")
-st.caption(
-    "Each conversation keeps its own history, and every answer uses the whole conversation as "
-    "context — you can switch models at any point and the new model picks it up. Very long chats "
-    "are summarised to fit the model. Your chats are listed in the sidebar — there are no "
-    "accounts yet, so everyone using this app sees the same list.",
-)
+# Filled once the chat list is loaded, which is where the title comes from.
+header_slot = st.empty()
 
 # The conversation's ID lives in the URL (?chat=...), so a refresh or a
 # shared link reopens it. No ID yet means a fresh conversation; the server
@@ -97,11 +94,7 @@ with st.sidebar:
     model, external_ok, api_key, is_external = render_model_selector("chat")
     include_debug = st.toggle("Include debug info", value=False)
 
-    if st.button("New chat", icon=":material/add_comment:", width="stretch", type="primary"):
-        _start_new_chat()
-        st.rerun()
-
-    st.subheader("Chats")
+    st.html('<div class="nyai-label">Recent</div>')
     if chats is None:
         render_api_error(chats_error)
     elif not chats["items"]:
@@ -184,19 +177,22 @@ with st.sidebar:
             except Exception as e:
                 render_api_error(e)
 
-if current_title:
-    st.subheader(current_title)
+with header_slot.container():
+    page_header(current_title or "Ask a question")
 
-if not st.session_state.chat_history:
-    selected = st.pills(
-        "Try asking:",
-        [
-            "What are the principles of natural justice?",
-            "What is the punishment for murder under Indian law?",
-            "Explain the right to life under Article 21",
-        ],
-        label_visibility="collapsed",
-    )
+user_input = st.chat_input("Ask a legal question...") or st.session_state.pop("pending_input", None)
+
+if not st.session_state.chat_history and not user_input:
+    with st.container(key="nyai-empty"):
+        hero(
+            "What would you like to research today?",
+            "Each conversation keeps its own history, and you can switch models at any point.",
+        )
+        selected = st.pills("Try asking:", SUGGESTIONS, label_visibility="collapsed")
+        st.html(
+            '<div class="nyai-note">Very long chats are summarised to fit the model. There are no accounts '
+            "yet, so everyone using this app sees the same chat list.</div>"
+        )
     if selected:
         st.session_state.pending_input = selected
         st.rerun()
@@ -218,8 +214,6 @@ for i, turn in enumerate(st.session_state.chat_history):
             if turn.get("debug"):
                 with st.expander("Debug info", icon=":material/bug_report:"):
                     st.json(turn["debug"])
-
-user_input = st.chat_input("Ask a legal question...") or st.session_state.pop("pending_input", None)
 
 if user_input:
     st.session_state.chat_history.append({"role": "user", "content": user_input})

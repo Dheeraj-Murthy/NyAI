@@ -4,45 +4,56 @@ address = "0.0.0.0"
 
 [theme]
 base = "light"
-primaryColor = "#18181B"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#FAFAFA"
-codeBackgroundColor = "#F4F4F5"
-textColor = "#09090B"
-linkColor = "#18181B"
-borderColor = "#E4E4E7"
+primaryColor = "#1F3A8A"
+backgroundColor = "#FAF8F4"
+secondaryBackgroundColor = "#FFFFFF"
+codeBackgroundColor = "#F3F4F7"
+textColor = "#141B2D"
+linkColor = "#1F3A8A"
+borderColor = "#E3E6EC"
 showWidgetBorder = true
 showSidebarBorder = true
-baseRadius = "6px"
-buttonRadius = "6px"
+baseRadius = "10px"
+buttonRadius = "10px"
 font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
 codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
 codeFontSize = "0.875rem"
-codeTextColor = "#18181B"
+codeTextColor = "#141B2D"
 baseFontSize = 14
 baseFontWeight = 400
-headingFontSizes = ["36px", "30px", "24px", "20px", "16px", "14px"]
+headingFontSizes = ["32px", "26px", "20px", "17px", "15px", "14px"]
 headingFontWeights = [600, 600, 600, 600, 600, 600]
-linkUnderline = true
+linkUnderline = false
 chartCategoricalColors = ["#18181B", "#71717A", "#A1A1AA", "#D4D4D8", "#3B82F6", "#EF4444", "#22C55E"]
 
-grayColor = "#71717A"
-blueColor = "#3B82F6"
-greenColor = "#22C55E"
-redColor = "#EF4444"
-yellowColor = "#EAB308"
-orangeColor = "#F97316"
+grayColor = "#6B7385"
+blueColor = "#1F3A8A"
+greenColor = "#1E7B4F"
+redColor = "#B42318"
+yellowColor = "#B7791F"
+orangeColor = "#B7791F"
 violetColor = "#8B5CF6"
 
-dataframeBorderColor = "#E4E4E7"
-dataframeHeaderBackgroundColor = "#FAFAFA"
+greenBackgroundColor = "#E3F4EA"
+greenTextColor = "#1E7B4F"
+redBackgroundColor = "#FDE7E5"
+redTextColor = "#B42318"
+blueBackgroundColor = "#E8EDFB"
+blueTextColor = "#1F3A8A"
+orangeBackgroundColor = "#FBF2E2"
+orangeTextColor = "#8A5A12"
+yellowBackgroundColor = "#FBF2E2"
+yellowTextColor = "#8A5A12"
+
+dataframeBorderColor = "#E3E6EC"
+dataframeHeaderBackgroundColor = "#F3F4F7"
 
 [theme.sidebar]
-backgroundColor = "#FAFAFA"
-secondaryBackgroundColor = "#F4F4F5"
-codeBackgroundColor = "#E4E4E7"
-textColor = "#09090B"
-borderColor = "#E4E4E7"
-primaryColor = "#18181B"
-dataframeHeaderBackgroundColor = "#F4F4F5"
-dataframeBorderColor = "#E4E4E7"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F4F7"
+codeBackgroundColor = "#EEF0F4"
+textColor = "#141B2D"
+borderColor = "#E3E6EC"
+primaryColor = "#1F3A8A"
+dataframeHeaderBackgroundColor = "#F3F4F7"
+dataframeBorderColor = "#E3E6EC"

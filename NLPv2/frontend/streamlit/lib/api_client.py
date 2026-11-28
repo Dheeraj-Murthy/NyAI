@@ -45,9 +45,9 @@ def _handle_response(resp: requests.Response) -> Dict[str, Any]:
     return payload
 
 
-def health() -> Dict[str, Any]:
+def health(timeout: float = DEFAULT_TIMEOUT) -> Dict[str, Any]:
     try:
-        resp = requests.get(_url("/health"), timeout=DEFAULT_TIMEOUT)
+        resp = requests.get(_url("/health"), timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as e:

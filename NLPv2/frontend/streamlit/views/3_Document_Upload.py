@@ -2,6 +2,7 @@ import streamlit as st
 
 from lib import api_client
 from lib.case_graph import render_answer_graph
+from lib.theme import page_header
 from lib.ui_helpers import (
     confidence_badge,
     linked_label,
@@ -12,10 +13,9 @@ from lib.ui_helpers import (
     render_sectioned_sources_and_citations,
 )
 
-st.set_page_config(page_title="Document upload — Legal RAG", page_icon=":material/upload_file:", layout="wide")
+st.set_page_config(page_title="Analyse a judgment — NyAI", page_icon=":material/upload_file:", layout="wide")
 
-st.title("Document upload", icon=":material/upload_file:")
-st.caption("Upload a PDF, DOCX, or TXT document. OCR runs server-side for scanned PDFs and can take a while.")
+page_header("Analyse a judgment", "Upload a PDF, DOCX, or TXT document. OCR runs server-side for scanned PDFs and can take a while.")
 
 uploaded_file = st.file_uploader("Document", type=["pdf", "docx", "txt"])
 mode = st.segmented_control(
@@ -96,7 +96,7 @@ if mode == "Summarize judgment" and summary_result:
             )
             st.space("small")
 
-        with st.container(border=True):
+        with st.container(border=True, key="nyai-answer"):
             st.markdown(summary_result.get("summary") or "No summary produced.")
 
         st.space("medium")
@@ -142,7 +142,7 @@ if mode == "Ask a question" and result:
             )
             st.space("small")
 
-        with st.container(border=True):
+        with st.container(border=True, key="nyai-answer"):
             if not result.get("answer_found", True):
                 st.warning(result.get("answer", "No answer produced."), icon=":material/search_off:")
             else:

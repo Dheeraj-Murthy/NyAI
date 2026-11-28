@@ -1,9 +1,10 @@
 import streamlit as st
 
 from lib import api_client
+from lib.theme import page_header
 from lib.ui_helpers import render_api_error
 
-st.set_page_config(page_title="Document — Legal RAG", page_icon=":material/description:", layout="wide")
+st.set_page_config(page_title="Document — NyAI", page_icon=":material/description:", layout="wide")
 
 # Opened from citation links: Document?type=judgment&id=123 or
 # Document?type=statute&id=<statute section ID>.
@@ -16,7 +17,7 @@ try:
 except ValueError:
     doc_id = None
 
-st.title("Document", icon=":material/description:")
+page_header("Document")
 
 if doc_id is None:
     st.caption("Open a cited judgment or statute from an answer, or look up a judgment by ID.")
@@ -74,5 +75,5 @@ if doc.get("has_pdf"):
 else:
     st.caption("The original PDF isn't available for this document yet; showing the stored text.")
 
-with st.container(height=640, border=True):
+with st.container(height=640, border=True, key="nyai-document"):
     st.text(doc.get("text") or "(No text stored for this document.)")

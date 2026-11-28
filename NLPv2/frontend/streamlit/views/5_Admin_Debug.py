@@ -1,11 +1,12 @@
 import streamlit as st
 
 from lib import api_client
+from lib.theme import page_header
 from lib.ui_helpers import render_api_error
 
-st.set_page_config(page_title="Admin / debug — Legal RAG", page_icon=":material/tune:", layout="wide")
+st.set_page_config(page_title="Admin / debug — NyAI", page_icon=":material/tune:", layout="wide")
 
-st.title("Admin / debug", icon=":material/tune:")
+page_header("Admin / debug")
 
 tab_status, tab_retrieval = st.tabs(["Pipeline status", "Retrieval test"])
 
